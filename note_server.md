@@ -74,9 +74,39 @@
 
 ## 特征点提取和匹配
 
-> 待补充：检测器、描述子、匹配策略、几何验证。
+> 检测器、描述子、匹配策略、几何验证；以 SuperPoint 权重生态为入口。
 
 ### 检测与描述
+
+**SuperPoint 没有官方 v1–v6 产品线。** 社区里常说的版本主要是两套预训练权重；v2–v5 多为 rpautrat 训练实验/合成数据集后缀，不是公开发布的独立架构。
+
+| | **v1** | **v6** |
+|--|--------|--------|
+| 来源 | MagicLeap 论文作者推理权重 | rpautrat TensorFlow 复现后转 PyTorch |
+| 权重 | `superpoint_v1.pth` | `superpoint_v6_from_tf.pth`（另有 `sp_v6.tgz` TF SavedModel） |
+| 许可 | MagicLeap 专有 | MIT |
+| 典型用途 | LightGlue / SuperGlue / ONNX / C++ 部署 | 自监督复现、蒸馏 teacher（早期） |
+
+**架构相同、实现不同**（均为 VGG 风格 encoder + detector/descriptor 双头，65 通道 detector、256 维描述子、stride 8）：
+
+| 特性 | v1 | v6 |
+|------|----|----|
+| BatchNorm | 无 | 有（`VGGBlock` 内 BN） |
+| 卷积组织 | `conv1a/conv1b/...` | `backbone` + `detector`/`descriptor` |
+| 描述子采样 | `kp - s/2 + 0.5`，`align_corners=True` | `(kp+0.5)/(hw*stride)`，`align_corners=False` |
+| 默认检测阈值 | 0.0005（LightGlue）；部署 YAML 常再调到 0.05/0.1 | 0.005 |
+
+**不可互换**：v1 权重不能加载到 v6 模型定义，反之亦然。
+
+**HPatches（rpautrat README）**：v6 光照 repeatability 与光照 homography 更好；v1 视角变化下描述子略强。
+
+**v2–v5 含义**：`synthetic_shapes_v6` 等是数据生成配置版本（如 blur/resize/homographic aug）；`mp_synth-v6/v10/v11` 是 MagicPoint 自监督迭代实验名（HA 轮次），不是独立公开 checkpoint。
+
+**部署注意**：SPSG ONNX 图只出 dense `scores`/`descriptors`；C++ 侧 `normalize_keypoints` 已是 **v1 采样公式**。训练 teacher 与后处理约定不一致会导致匹配变差。
+
+本地路径：`tiny_point/SuperPoint/weights/`；论文 [DeTone et al., 2018](https://arxiv.org/abs/1712.07629)；实现 [MagicLeap](https://github.com/MagicLeapResearch/SuperPointPretrainedNetwork)、[rpautrat](https://github.com/rpautrat/SuperPoint)。
+
+> **来源** · 2026-08-27 · SuperPoint v1 与 v6 差异 · chat: `42d2be9d-5210-422d-8e7c-b7b6cb434b35` · workspace: `maoli`
 
 ### 匹配与几何验证
 
