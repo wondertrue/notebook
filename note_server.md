@@ -4,11 +4,55 @@
 
 ## Contents
 
+- [硬件平台](#硬件平台)
 - [深度学习基础知识](#深度学习基础知识)
 - [特征点提取和匹配](#特征点提取和匹配)
 - [VLN](#vln)
 - [3D-GS](#3d-gs)
 - [3D 场景图](#3d-场景图)
+
+---
+
+## 硬件平台
+
+> 训练/推理所用服务器、GPU、Docker 环境与 CUDA 栈。
+
+### 217 服务器
+
+**宿主机**
+
+| 项 | 值 |
+|----|-----|
+| 标识 | 217 服务器 |
+| hostname | `shd-ai-02` |
+| GPU | 2 × NVIDIA GeForce RTX 3090（24576 MiB） |
+| 驱动 | 580.173.02 |
+| 驱动支持的最高 CUDA（`nvidia-smi`） | 13.0 |
+
+**Docker：`clip_lora`**
+
+| 项 | 值 |
+|----|-----|
+| 镜像 | `clip_lora_saved:v1` |
+| 系统 | Ubuntu 22.04.3 LTS |
+| 挂载 | `/PnP` → `/PnP`；`/data` → `/workspace` |
+| CUDA Toolkit（`nvcc`） | 11.8（V11.8.89） |
+| PyTorch | 2.7.1+cu118 |
+| PyTorch 编译 CUDA | 11.8 |
+| `torch.cuda.is_available()` | True |
+
+**说明**：容器内实际使用 **CUDA 11.8**；`nvidia-smi` 显示的 13.0 是驱动能支持的最高 CUDA 版本，不是容器内安装的版本。
+
+**常用命令**
+
+- 启动：`docker start clip_lora`
+- 进入：`docker exec -it clip_lora bash`
+- 查看 GPU：`nvidia-smi`
+- 指定 GPU 训练：`CUDA_VISIBLE_DEVICES=0 python train.py`
+
+### 笔记
+
+> **来源** · 2026-08-27 · 217 服务器 clip_lora CUDA 环境 · chat: `61019486-efeb-40eb-9c0b-ba2bea826b48` · workspace: `maoli`
 
 ---
 
