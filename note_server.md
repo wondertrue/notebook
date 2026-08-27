@@ -8,6 +8,7 @@
 - [特征点提取和匹配](#特征点提取和匹配)
 - [VLN](#vln)
 - [3D-GS](#3d-gs)
+- [3D 场景图](#3d-场景图)
 
 ---
 
@@ -108,3 +109,82 @@ Vision-Language Navigation。
 ### 训练
 
 ### 笔记
+
+---
+
+## 3D 场景图
+
+> 3D 场景图表示、跨模态对齐与房间检索；以 VLSG（Visual-Language Scene Graph Alignment）复现为主线。
+
+### 任务与数据
+
+**VLSG 任务**：跨模态 **3D 房间检索** — 给定查询 RGB 序列（来自未知房间的 rescan），在参考场景库中检索最匹配的 reference scan。
+
+**3RScan 中的 scan**
+
+- 一个 scan = 对某房间 **某一次** RGB-D 扫描记录，不等于「房间」本身；同一物理房间可有多次 scan（reference + 多个 rescan）。
+- **Reference scan**：参考场景库条目，含 mesh、标注 PLY、`sequence/`（RGB-D 帧）。
+- **Rescan (Query)**：重扫描，推理时作为查询输入，需匹配到正确的 reference。
+
+**推理所需数据**（不必下载全量 train）
+
+- `val_resplit` / `test_resplit` 对应 scan 及 rescan、`sequence.zip` 解压后的帧序列。
+- 3DSSG 场景图标注、`meta.zip`（相机内参等）。
+- 预训练权重：`output/train/pretrained_3rscan.pth`。
+
+### VLSG 架构与数据流
+
+**两大模块**
+
+| 模块 | 时机 | 输入 | 产出 |
+|------|------|------|------|
+| **查询端 (Query)** | 在线 | Rescan RGB 帧 | `Features2D/` patch 特征 |
+| **参考场景库 (Reference DB)** | 离线预构建 | PLY+JSON、参考扫描 RGB | `scene_graph/`、`Features3D/`、`patch_anno/` |
+
+**特征两路**
+
+- **2D**：DINOv2-ViT-G/14，整帧 resize 1024×576 → 每帧 144 patch × 1536 维；**无需** bbox/点云，仅需 RGB。
+- **3D 物体视觉**：同一 DINOv2；依赖 GT 2D 投影确定物体可见帧，Top-10 帧 + 多层级 bbox crop，聚合为 per-object 特征。
+
+**推理**：`Features2D + Features3D + patch_anno + scene_graph` + 预训练模型 → Patch-Object 对齐 + GAT 场景图编码 → 房间检索排名。
+
+**mmdet / mmcv**：主要用于 GCVit backbone 注册与 checkpoint 加载；推理配置 `use_feature: True` 时不走检测前向，但 import 链仍需兼容 mmcv 2.x / mmdet 3.x。
+
+### 复现与环境
+
+- **环境**：Docker `clip_lora`，Conda `VLSG`（`/opt/conda/envs/VLSG`），Python 3.8，PyTorch 2.1+cu118，mmcv 2.1.0，mmdet 3.3.0。
+- **工作目录**：`/PnP/maoli/VLSG`，数据 `/PnP/maoli/data/3RScan`。
+- **预处理顺序**：对齐 PLY → `preprocess_scan3r.py`（scene_graph）→ GT 2D 投影 → patch 标注 → 2D DINOv2 特征 → 3D 物体 DINOv2 特征。
+- **推理**：`bash scripts/train_val/inference.sh val` / `test`；入口 `src/room_retrieval/patch_SGIE_aligner/inference_room.py`。
+- **完整文档**：`/PnP/maoli/REPRODUCTION_GUIDE.md`。
+
+**常见坑**
+
+- DINOv2 在 Python 3.8 需 `from __future__ import annotations`（torch hub 缓存内 attention.py）。
+- mmcv 1.x API → mmengine / mmdet.registry；`scan3r_objpair_XTAE_SGI.py` 对缺失特征文件用空占位 `{'obj_visual_emb': {}, 'obj_image_votes_topK': {}}`。
+- 部分 test scan 无 `sequence/`，时序 R@1 偏低属预期；Non-Temporal 指标仍正常。
+
+### 评测与可视化
+
+**Val 关键指标**（与论文一致）
+
+- R@1 (Temporal-Sequential)：87.8%；R@1 (Non-Temporal)：90.9%；Patch R@1：73.7%。
+
+**输出目录** `output/inference/`
+
+- 数值：`val_result.txt`、`val_temp_statistics/val_retrieval_statistics.txt`
+- 图表：混淆矩阵、检索成功率 vs 时间步、Shannon 熵分析（PNG）
+- 检索记录：`retrieval_record_val.pkl` — 每 query scan 含 `frames_retrieval`、`room_score_scans_T/NT`、`temporal_scan_id`（GT）
+
+**定性查看**
+
+- PLY：`labels.instances.annotated.v2.ply`（带实例颜色，可用 maplab 打开）。
+- 示例包：`/PnP/maoli/retrieval_examples/`（query 帧 + Top-1 PLY + README）；流程图 `VLSG_pipeline.png`，检索拼图 `VLSG_retrieval_vis.png`。
+
+### 笔记
+
+- 代码仓库：`git@github.com:y9miao/VLSG.git`（本地 `/PnP/maoli/VLSG`）。
+- Point-NN 子模块：`thrid_party/Point-NN`，需 `pip install -e pointnet2_ops_lib`。
+- 容器内文件拷到宿主机：`docker cp clip_lora:/path/in/container /tmp/...`（勿用 `docker exec cp` 到容器内 `/tmp` 误以为在宿主机）。
+
+> **来源** · 2026-08-27 · VLSG 推理复现与可视化 · chat: `31e39936-4d25-498c-a9fc-a3c51eaa281d` · workspace: `maoli`
