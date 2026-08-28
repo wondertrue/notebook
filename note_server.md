@@ -152,6 +152,89 @@
 
 > **来源** · 2026-08-27 · SuperPoint v1 与 v6 差异 · chat: `42d2be9d-5210-422d-8e7c-b7b6cb434b35` · workspace: `maoli`
 
+### HPatches 数据集
+
+**定位**：标准 benchmark，**不参与 SuperPoint 训练**，只用于评估检测器/描述子。
+
+**本地路径**：`/PnP/maoli/tiny_point/datasets/hpatches-sequences-release`（1.8 GB，116 序列：57 个光照 `i_*` + 59 个视角 `v_*`）。`eval_hpatches.py` 中 `HPATCHES_ROOT` 默认指向该目录。
+
+**目录结构**（每个序列 6 张图 + 单应矩阵）：
+
+```
+hpatches-sequences-release/
+├── i_ajuntament/          # 光照变化
+│   ├── 1.ppm ... 6.ppm    # 参考图为 1.ppm
+│   ├── H_1_2 ... H_1_6    # 图1 → 图2~6 的单应矩阵
+│   └── attribs.txt
+├── v_abstract/            # 视角变化
+└── ...
+```
+
+- **`i_*`**：同一场景，光照/曝光变化（`H` 接近单位阵）
+- **`v_*`**：同一场景，相机视角/位置变化（`H` 有明显变换）
+- 图像格式 **PPM**，分辨率 **640×480**
+
+**图像示例**（上排光照 `i_ajuntament`，下排视角 `v_abstract`，各 6 张）：
+
+![HPatches 序列示例](assets/hpatches_preview.jpg)
+
+**评估方式**（以图 1 为参考，分别与图 2~6 配对）：
+
+| 指标 | 测什么 | 简要流程 |
+|------|--------|----------|
+| **Repeatability** | 检测器 | 两图各检测点 → 用 `H_1_i` 把图1点搬到图 i → 统计 3px 内能对上的比例 |
+| **Homography accuracy / MMA** | 描述子 | 描述子匹配 → RANSAC 估 `H_est` → 与 GT `H_1_i` 比 corner error |
+
+v6（rpautrat）README 步骤 4/7 即上述流程；v1（MagicLeap）**无训练/评估代码**，但论文实验部分有介绍 HPatches 评估方法。
+
+### COCO 伪标签（Homographic Adaptation）
+
+**问题**：COCO 没有人工关键点标注，SuperPoint 用 **Homographic Adaptation（HA，单应自适应）** 自动生成伪标签。
+
+**核心思路**：对每张 COCO 图做多次随机单应变换，每次用已训练的 MagicPoint 检测，把结果**反投影回原图并累加**，阈值化后得到稳定关键点。
+
+**导出流程**（`export_detections.py`，配置 `homography_adaptation.num: 100`）：
+
+```
+COCO 原图
+  ├─ 随机单应 #1 → MagicPoint 检测 → 反投影回原图
+  ├─ 随机单应 #2 → ...
+  └─ 随机单应 #100 → ...
+        ↓ 累加概率图 → 阈值
+  保存 COCO12345.npz（points: N×2）
+```
+
+**训练时用法**（`coco.py`）：读取 `.npz` 的 `points` → 转成 `keypoint_map`（稀疏 0/1 监督图）；训练增强时再随机单应变换，**标签坐标随 H 一起变换**（`warp_points`）。
+
+**图像示例**（演示用 12 次 HA，正式导出为 100 次；单次检测 ~1870 点，聚合后 ~3032 点）：
+
+![COCO 伪标签生成流程](assets/coco_pseudo_label_demo.jpg)
+
+| 面板 | 含义 |
+|------|------|
+| ① 原图 | COCO 图，尚无标签 |
+| ② 随机变换 | 扭曲后 MagicPoint 检测（黄点） |
+| ③ 累加热力图 | 多次反投影叠加（HA） |
+| ④ 伪标签 | 阈值后的关键点（绿点）→ 存 `.npz` |
+| ⑤ 训练增强 | 训练时再随机变换，标签随 H 走 |
+| ⑥ 导出格式 | 每张 COCO 图对应一个 `xxx.npz` |
+
+**SuperPoint 完整训练数据流**：
+
+```
+Synthetic Shapes → MagicPoint（学会找角点）
+       ↓
+COCO + HA 导出伪标签 → MagicPoint on COCO（适应真实图）
+       ↓
+再导出伪标签 → SuperPoint 联合训练（检测 + 描述子）
+       ↓
+HPatches 评估（repeatability / homography accuracy）
+```
+
+**代码参考**：`tiny_point/SuperPoint/superpoint/models/homographies.py`（`homography_adaptation`）、`superpoint/datasets/coco.py`、`configs/magic-point_coco_export.yaml`。
+
+> **来源** · 2026-08-28 · HPatches 与 COCO 伪标签 · chat: `bb3d28ad-215c-4e6e-82b4-ec5fce853847` · workspace: `maoli`
+
 ### 匹配与几何验证
 
 ### 笔记
