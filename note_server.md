@@ -76,7 +76,7 @@
 
 ### 网络结构
 
-（本对话未展开；见 `rob_slam-research` 项目 `train/mobilenet_sp/model.py`。）
+（详见 [特征点提取和匹配 → 跨 cell 上下文](#跨-cell-上下文架构对比)；实现见 `rob_slam-research/train/mobilenet_sp/model.py`。）
 
 ### 训练与优化
 
@@ -151,6 +151,66 @@
 本地路径：`tiny_point/SuperPoint/weights/`；论文 [DeTone et al., 2018](https://arxiv.org/abs/1712.07629)；实现 [MagicLeap](https://github.com/MagicLeapResearch/SuperPointPretrainedNetwork)、[rpautrat](https://github.com/rpautrat/SuperPoint)。
 
 > **来源** · 2026-08-27 · SuperPoint v1 与 v6 差异 · chat: `42d2be9d-5210-422d-8e7c-b7b6cb434b35` · workspace: `maoli`
+
+### 跨 cell 上下文（架构对比）
+
+**「跨 cell 上下文」指什么**
+
+- stride-8 网格上，每个 cell 的 detector 决策是否利用了**邻域 cell / 更大感受野**的语义，而不只是本 cell 内 8×8 像素的局部信息。
+- SuperPoint / MobileNetSP 的 **65 类 softmax 是 per-cell 的**（64 子像素 + dustbin），softmax 本身不跨 cell；跨 cell 能力来自 **共享深层特征 + head 上的空间卷积**。
+- NMS 是 decode 后的后处理，提供跨关键点抑制，**不参与训练稠密 target**，也不能补回 detector 没学到的跨 cell 一致性。
+
+**SuperPoint v1 detector**
+
+```
+图像 → 共享 encoder（conv1–4，stride 8）→ convPa(3×3) → convPb(1×1) → 每 cell 65 类 softmax
+              ↑                                    ↑
+        跨 cell 深层语义                      显式混邻域 cell
+```
+
+- 每个 cell 的 65 类分布由 **大感受野共享特征 + 3×3 head** 决定，邻域角点/边缘信息会进入当前 cell 的 logits。
+
+**MobileNetSP（蒸馏 student）**
+
+```
+图像 → HFNetLocalBackbone（stride 8）→ detector_head(3×3+1×1) / descriptor_head(3×3+1×1)
+              ↑
+    与 SuperPoint 同构：共享 backbone + 3×3 head，有跨 cell 上下文
+```
+
+- 有跨 cell 能力，但 depthwise separable + 更小通道（96 vs 128）→ 每层混合弱于 SuperPoint 全卷积，不保证达到 teacher 的 viewpoint repeatability 上限。
+- 蒸馏损失逐 cell 独立（detector 软 CE + descriptor 稠密 L2），跨 cell 行为靠卷积感受野隐式学习。
+
+**XFeat detector（关键差异）**
+
+XFeat **也有 cell 结构**（输出 `[B,65,H/8,W/8]`，decode 后 pixel_shuffle 到全分辨率），但 **keypoint 分支不接 backbone**：
+
+```
+图像 ──► block1–5 + fusion ──► feats / heatmap（描述子、可靠性）  ← 有跨 cell
+  │
+  └──► _unfold2d(原图, ws=8) ──► keypoint_head（全 1×1 卷积）──► 65 类
+                              ↑
+                    每 cell 仅 64 个原图像素 channel，无跨 cell
+```
+
+| 维度 | SuperPoint | MobileNetSP | XFeat keypoint_head |
+|------|------------|-------------|---------------------|
+| detector 输入 | 共享深层特征 | 共享 backbone 特征 | unfold 后的原图像素 |
+| head 空间卷积 | 3×3 + 1×1 | 3×3 + 1×1 | 仅 1×1 |
+| 跨 cell 上下文 | 有 | 有（可能弱于 SP） | **几乎没有** |
+| 描述子分支 | 共享 encoder | 共享 backbone | 独立深 CNN（有跨 cell） |
+
+- XFeat 的 CNN **服务于描述子**，detector 被 architecturally bypass；`keypoint_head` 在每个 stride-8 位置等价于「64 像素 → 65 类」的小 MLP。
+- 实践中可能表现为 **点更多 / 更噪**：相邻 cell 各自独立响应，cell 边界附近易产生 competing peaks；NMS 只能事后抑制，不能替代训练阶段的跨 cell 一致性。
+- 即使训练流程正确，XFeat detector 在架构上对 **viewpoint repeatability** 存在上限；MobileNetSP 因共享 backbone + 3×3 head，在这方面更接近 SuperPoint。
+
+**代码参考**
+
+- SuperPoint v1：`rob_slam-research/dependencies/internal/superpoint-superglue/convert2onnx/superpoint.py`
+- MobileNetSP：`rob_slam-research/train/mobilenet_sp/model.py`
+- XFeat：`tiny_point/accelerated_features/modules/model.py`（`keypoint_head` + `_unfold2d`）
+
+> **来源** · 2026-08-30 · 跨 cell 上下文架构对比（SuperPoint / MobileNetSP / XFeat）· workspace: `maoli`
 
 ### HPatches 数据集
 
