@@ -8,6 +8,7 @@
 - [特征点提取和匹配](#特征点提取和匹配)
 - [VLN](#vln)
 - [3D-GS](#3d-gs)
+- [建图和定位](#建图和定位)
 
 ---
 
@@ -120,3 +121,39 @@ for area in bpy.context.screen.areas:
 ### 训练
 
 ### 笔记
+
+---
+
+## 建图和定位
+
+> 视觉 SLAM 中的建图（Mapping）与定位（Localization/Relocalization）方法，重点记录基于物体级别的系统。
+
+### GOReloc
+
+**GOReloc**（Graph-based Object-Level Relocalization）——RAL 2024 论文，基于 OA-SLAM / VOOM 扩展，用于视觉 SLAM 的**物体级重定位**。
+
+- **核心思路**：用图结构描述物体之间的空间关系，通过图核（graph kernel）语义描述子，将当前帧的检测物体与地图中的 3D 物体做鲁棒关联，再用类 RANSAC 策略精化关联和位姿估计。
+- **地图表示**：轻量的物体级地图，每个物体用**椭球体（Ellipsoid）**表示（位置、朝向、三轴尺寸）。
+- **两阶段流程**：
+  1. **建图**：运行 VOOM/OA-SLAM，生成含关键帧、ORB 地图点、物体椭球体的地图（`.yaml` + JSON）。
+  2. **定位**：运行 `loc_tum`，加载地图，对新序列帧逐帧做重定位（`goreloc` 或 `points` 模式）。
+- **关键代码位置**：
+  - 图构建：`Tracking::GrabImageRGBD`（`src/Tracking.cc` ~L370）
+  - GOReloc 核心：`Tracking::GOReloc`（`src/Tracking.cc` ~L2360）
+  - 地图存取：扩展的 OSMAP 库（`src/Osmap.cc`）
+
+**Viewer 中各显示层的含义**：
+
+| 显示选项 | 内容 |
+|----------|------|
+| **Show Points** | 所有 ORB MapPoints。普通点用自身颜色；Reference MapPoints 红色；临时点（TmpPoints）绿色 |
+| **Show Obj-Points** | 被归属于某个 Object 的 MapPoints，用该物体的颜色着色 |
+| **Show Objects** | 每个 3D 物体的椭球体轮廓（线框），颜色随机或按类别着色；也可切换为 3D OBB（勾选 Disp 3D Bboxes） |
+
+**ORB 与 YOLO 的分工**：
+
+- **YOLO**（离线）：对图像做目标检测，输出 2D bbox + 类别 + 置信度，结果存为 JSON 文件。定位阶段直接读文件，不实时调用。
+- **ORB**（在线）：提取图像关键点 + 描述子 → 三角化生成 3D MapPoints → 词袋重定位候选帧检索 → PnP 位姿解算。
+- **融合方式**：在关键帧上，取落在 YOLO bbox 范围内的所有 ORB MapPoints（`kf->GetFeaturesInBox`），归属给对应 Object，用于拟合椭球体形状（`OptimizeReconstructionQuat`）。ORB 负责几何定位，YOLO 负责语义标注，二者互补。
+
+> **来源** · 2026-08-30 · GOReloc 建图定位系统解析 · chat: `a1c26f79-dfe0-40cf-8152-ff92606389c1` · workspace: `GOReloc`
