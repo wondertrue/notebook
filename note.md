@@ -254,3 +254,63 @@ rosbag play /data/maoli/git/fast_livo_ws/data/HKU_Cultural_Center_01.bag
 - rviz 中稠密彩色点云来自 **LiDAR 点云投影取色**（`dense_map_en`），不是视觉"造点"
 
 > **来源** · 2026-08-31 · FAST-LIVO2 编译运行与视觉更新原理 · chat: `203305fd-8df6-444e-b266-1fa562b1aab1` · workspace: `fast_livo_ws`
+
+### perception_oru NDT（D2D vs P2D）
+
+**工作空间**：`/home/maoli/Data/unitree/IROS/ndt_ws`（`perception_oru` 包，`ndt_registration` / `ndt_fuser`）
+
+**提出时间线**：
+
+| 时间 | 工作 | 算法 |
+|------|------|------|
+| 2003 | Biber & Strasser, IROS | **P2D-NDT**（Point-to-Distribution），2D 激光 |
+| 2007 | Magnusson 博士论文（Örebro） | **D2D-NDT**（Distribution-to-Distribution），推广到 3D |
+| ~2009 | PCL 集成 | P2D-NDT（`pcl::NormalDistributionsTransform`） |
+| 2010+ | `perception_oru` | 同时实现 P2D（`NDTMatcherP2D`）和 D2D（`NDTMatcherD2D` / `NDTMatcherD2D_2D`） |
+
+**P2D-NDT（PCL 路线）**：
+
+- 目标点云建 NDT 地图（体素含均值 μ、协方差 Σ）
+- 源点云中每个点 pᵢ 查对应体素，score = exp(−0.5·(pᵢ−μ)ᵀ·Σ⁻¹·(pᵢ−μ))
+- 对变换 T 求导，Newton 优化
+- **单边**：只有目标侧是分布，源侧是原始点
+
+**D2D-NDT（perception_oru / ndt_fuser 路线）**：
+
+- 源、目标**各自**建 NDT 地图
+- 匹配体素对 (Nₛ, Nₜ)：Δμ = T·μₛ − μₜ，合并协方差 Σ = Σₜ + R·Σₛ·Rᵀ
+- score = exp(−0.5·Δμᵀ·Σ⁻¹·Δμ)
+- **双边**：旋转也传播源侧 Σ，统计上更完整
+
+**对比表**：
+
+| 维度 | PCL P2D-NDT | perception_oru D2D-NDT |
+|------|-------------|------------------------|
+| 源侧表示 | 原始点 | NDT 体素（含 Σ） |
+| 旋转对协方差 | 不处理源侧 Σ | R·Σₛ·Rᵀ 参与合并 |
+| 多分辨率 | 支持 | 默认 2m→0.5m→0.2m 逐级精化 |
+| 点云密度差异 | 较敏感 | 源侧 Σ 吸收稀疏噪声，更鲁棒 |
+| 增量建图 | 目标 NDT 复用 | 天然分布对分布，适合 SLAM |
+| 并行 | 部分 OpenMP | `ndt_matcher_d2d.cpp` 含 OpenMP |
+| 计算量 | 较低 | 较高（两边都建图） |
+
+**`ndt_fuser` 实际用法**：
+
+- `matchLaser=true`（2D 激光）→ `NDTMatcherD2D_2D`
+- 每帧激光先建局部 NDT（`ndlocal`），再与全局地图 D2D 配准
+- `useOdometry=false` 时 Tmotion=Identity，主要靠 D2D 宽收敛域 + 多分辨率
+
+**D2D 更优的典型场景**：
+
+- 无可靠轮速/里程计，初始位姿差
+- 2D 激光单帧稀疏（如 UTBM `/scan` ~540 rays）
+- 地图与当前帧密度不一致的增量建图
+
+**PCL 未集成 D2D 的原因（简述）**：
+
+- 自动驾驶场景（高密度 Velodyne + IMU）下 P2D 已够用
+- D2D 需重构数据结构（源侧也要 NDT Map），集成代价大
+- `perception_oru` 团队未向 PCL 提 PR；PCL 长期低活跃
+- Autoware 等对 P2D 做了大量工程优化（OpenMP/GPU），进一步降低迁移动机
+
+> **来源** · 2026-08-31 · D2D-NDT 与 P2D-NDT 对比 · chat: `0b5efb9d-02fc-4dfa-888e-ee4e9b4269cf` · workspace: `perception_oru`
