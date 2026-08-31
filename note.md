@@ -157,3 +157,100 @@ for area in bpy.context.screen.areas:
 - **融合方式**：在关键帧上，取落在 YOLO bbox 范围内的所有 ORB MapPoints（`kf->GetFeaturesInBox`），归属给对应 Object，用于拟合椭球体形状（`OptimizeReconstructionQuat`）。ORB 负责几何定位，YOLO 负责语义标注，二者互补。
 
 > **来源** · 2026-08-30 · GOReloc 建图定位系统解析 · chat: `a1c26f79-dfe0-40cf-8152-ff92606389c1` · workspace: `GOReloc`
+
+### FAST-LIVO2
+
+**FAST-LIVO2**（Fast, Direct LiDAR-Inertial-Visual Odometry）——港大 Mars Lab 的激光-惯性-视觉紧耦合里程计，视觉部分为**稀疏直接法**（sparse direct），不是稠密直接法。
+
+**工作空间**：`/data/maoli/git/fast_livo_ws`
+
+**环境依赖**（Ubuntu 18.04 + ROS Melodic）：
+
+- OpenCV 4.5.4：`/home/maoli/opt/opencv-4.5.4`
+- Sophus 非模板版 `a621ff`（需 `libSophus.so`，安装到 `/usr/local`）
+- `rpg_vikit`（catkin 包，放 `src/`）
+- 为消除 OpenCV 3.2/4.5 混用崩溃，工作空间内重编：
+  - `vision_opencv/cv_bridge`（OpenCV 4）
+  - `image_transport_plugins`（compressed / compressed_depth / theora）
+- 不影响系统 `/opt/ros` 和其他 workspace（如 maplab），只在 `source fast_livo_ws/devel` 的终端生效
+
+**编译命令**：
+
+```bash
+source /opt/ros/melodic/setup.bash
+cd /data/maoli/git/fast_livo_ws
+catkin_make -DOpenCV_DIR=/home/maoli/opt/opencv-4.5.4/lib/cmake/opencv4 -DCMAKE_BUILD_TYPE=Release
+source devel/setup.bash
+```
+
+**运行命令**（以 HKU_Cultural_Center_01 为例）：
+
+```bash
+# 两个终端都先 source
+source /opt/ros/melodic/setup.bash
+source /data/maoli/git/fast_livo_ws/devel/setup.bash
+
+# 终端 1：启动建图 + rviz
+roslaunch fast_livo mapping_avia.launch
+
+# 终端 2：播放 bag
+rosbag play /data/maoli/git/fast_livo_ws/data/HKU_Cultural_Center_01.bag
+```
+
+**数据集与标定注意**：
+
+- bag 话题：`/livox/lidar`、`/livox/imu`、`/left_camera/image`
+- 每个序列的相机内参 + 相机-LiDAR 外参不同，需按 `data/calibration.yaml` 对应组修改：
+  - `config/camera_pinhole.yaml`（内参）
+  - `config/avia.yaml` 中 `Rcl` / `Pcl`（外参）
+- `HKU_Cultural_Center_01` 用 calibration.yaml 中 **HKU 系列**那组，不是仓库默认的 CBD/Retail 组
+
+**rviz / `/rgb_img` 中彩色点的含义**（`vio.cpp` → `plotTrackedPoints()`）：
+
+- 底图：当前相机帧副本 `img_cp`
+- 每个点：`visual_submap` 中的 `VisualPoint`，由 LiDAR 3D 点投影到当前图像
+- 🟢 **绿色**（BGR `0,255,0`）：`errors ≤ propa_errors`，光度残差未变差 → **内点（inlier）**，参与 VIO 更新
+- 🔵 **蓝色**（BGR `255,0,0`）：`errors > propa_errors`，优化后残差比 IMU 先验还差 → **外点（outlier）**，不可靠
+- 蓝点成片通常意味着：外参/内参不准、遮挡、动态物体、光照变化
+
+**视觉更新逻辑（patch + EKF）**：
+
+1. **地图点来源**：3D 位置 `pt->pos_` 来自 **LiDAR 点云**，不由视觉三角化
+2. **测量模型（patch 直接法）**：
+   - 每个点存参考 patch（`ref_patch`），当前帧用仿射 warp 对齐
+   - 残差 = 当前像素强度 − 参考 patch 强度（带逆曝光补偿）
+   - 每个点贡献 `patch_size × patch_size`（默认 8×8=64）个光度残差，不是 2D 重投影
+3. **估计器（迭代 ESIKF）**（`computeJacobianAndUpdateEKF` → `updateState`）：
+   - 状态：`[3 旋转, 3 平移, 1 逆曝光]`（**不含地标 3D 坐标**）
+   - 对每个金字塔层迭代：算 `H_sub`（光度残差对状态的雅可比）→ 卡尔曼增益更新位姿
+   - 与 IMU 先验紧耦合：`vec = state_propagat - state`
+4. **地图维护（非 EKF）**：
+   - `generateVisualMapPoints`：从 LiDAR 点新建视觉点
+   - `updateVisualMapPoints`：追加新观测（Feature = patch + 位姿）
+   - `updateReferencePatch`：按观测质量更新参考 patch
+
+**与 ROVIO（`ImgUpdate.hpp`）的对比**：
+
+| 维度 | FAST-LIVO2 | ROVIO |
+|------|-----------|-------|
+| 观测模型 | 稀疏直接法光度 patch | 直接法 patch（`useDirectMethod_=true`） |
+| 估计器 | 手写迭代 ESIKF | LWF 框架迭代 EKF |
+| 地标是否在状态 | **否**，深度来自 LiDAR | **是**，估计 bearing + 逆深度 |
+| 残差结构 | 全 patch 逐像素堆叠（`H_DIM = N×64`） | 每特征降维成 2D（`A_red_`, `b_red_`） |
+| 坐标系 | world-centric | robocentric |
+| 曝光估计 | 逆曝光进状态 | 无全局曝光状态 |
+| 传感器 | LIVO（激光+IMU+相机） | 纯 VIO（IMU+相机） |
+
+**patch 直接法 vs 光流特征+几何法**：
+
+- 直接法优势：信息密度高（每点 64 个亚像素光度约束）、弱纹理可用、无描述子匹配、不确定度端到端建模
+- 直接法劣势：亮度恒定假设脆弱、收敛盆地小（强依赖 IMU 先验）、对标定/外参/曝光敏感、外点剔除难
+- 特征法优势：几何重投影误差更鲁棒、支持在线外参/td 自标定、RANSAC 剔除外点
+- **标定精度低时优先特征法 + 在线外参估计**；直接法需先标定到位（Kalibr + FAST-Calib）
+
+**稠密地图澄清**：
+
+- 视觉 EKF 每帧只处理几十~几百个稀疏点（日志 `Retrieve N points`）
+- rviz 中稠密彩色点云来自 **LiDAR 点云投影取色**（`dense_map_en`），不是视觉"造点"
+
+> **来源** · 2026-08-31 · FAST-LIVO2 编译运行与视觉更新原理 · chat: `203305fd-8df6-444e-b266-1fa562b1aab1` · workspace: `fast_livo_ws`
