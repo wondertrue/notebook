@@ -314,3 +314,30 @@ rosbag play /data/maoli/git/fast_livo_ws/data/HKU_Cultural_Center_01.bag
 - Autoware 等对 P2D 做了大量工程优化（OpenMP/GPU），进一步降低迁移动机
 
 > **来源** · 2026-08-31 · D2D-NDT 与 P2D-NDT 对比 · chat: `0b5efb9d-02fc-4dfa-888e-ee4e9b4269cf` · workspace: `perception_oru`
+
+### Cartographer
+
+**工作空间**：`/home/maoli/Data/unitree/IROS/cartographer_ws`
+
+**文档索引**：
+
+| 文档 | 路径 | 说明 |
+|------|------|------|
+| AGENTS.md | `/home/maoli/Data/unitree/IROS/cartographer_ws/src/AGENTS.md` | AI 助手仓库指南：工作空间布局、`catkin_make_isolated` 编译流程、模块架构与改代码清单 |
+| paper_info.md | `/home/maoli/Data/unitree/IROS/cartographer_ws/src/paper_info.md` | Cartographer 原论文（Real-Time Loop Closure in 2D LIDAR SLAM）中英文摘录：闭环、SPA 优化、扫描匹配 |
+| pipeline.md | `/home/maoli/Data/unitree/IROS/cartographer_ws/src/pipeline.md` | 2D Demo（`demo_backpack_2d.launch`）端到端数据流与源码走读 |
+| tutorial.md | `/home/maoli/Data/unitree/IROS/cartographer_ws/src/tutorial.md` | 运行命令速查：2D/3D 建图、纯定位、landmarks demo |
+
+**pipeline.md 章节概要**（`demo_backpack_2d.launch` + MultiEchoLaserScan + IMU）：
+
+1. **启动架构**：Launch 层次（`demo_backpack_2d` → `backpack_2d` + rviz + rosbag play）、`backpack_2d.lua` 关键参数、ROS / 桥接 / Cartographer 核心三层架构
+2. **端到端数据流**：rosbag → `cartographer_node` → SensorBridge → Collator → LocalTrajectoryBuilder2D → PoseGraph2D → TF 发布的时序图
+3. **传感器接入**：订阅 `imu` / `echoes`；SensorBridge 做激光切分（10 段运动补偿）、TF 变换；Collator 按时间戳排序投递
+4. **2D 点云位姿计算**（Local SLAM）：累积 10 帧 → 逐点 IMU 外推运动补偿 → 重力对齐 → Ceres scan matcher 对 active submap 优化 → `AddPose` 更新
+5. **IMU 与雷达融合**：非经典 EKF；IMU 提供旋转外推与重力方向，雷达 scan match 通过 `AddPose()` 校正；平移外推来自历史匹配位姿差分
+6. **后端 Pose Graph**：`AddNode` → 子图内约束 + 回环搜索 → SPA 全局优化（Ceres）
+7. **输出与可视化**：TF `map→odom→base_link`、`/submap_list`、`/map`、`/scan_matched_points2` 等
+8. **关键文件索引**：ROS 层 / Local SLAM / Global SLAM 源码路径速查
+9. **总结**：2D 位姿 = 运动补偿 + 重力对齐 + Ceres 匹配；融合方式 = IMU 外推 + 扫描匹配校正
+
+> **来源** · 2026-08-31 · Cartographer 文档索引与 pipeline 概要 · chat: `04c2d32e-c80f-4e0b-bc2e-4d5bc27c3b2a` · workspace: `src`
