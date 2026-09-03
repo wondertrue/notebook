@@ -5,10 +5,12 @@
 ## Contents
 
 - [深度学习基础知识](#深度学习基础知识)
+- [计算机视觉基础知识](#计算机视觉基础知识)
 - [特征点提取和匹配](#特征点提取和匹配)
 - [VLN](#vln)
 - [3D-GS](#3d-gs)
 - [建图和定位](#建图和定位)
+- [maplab](#maplab)
 
 ---
 
@@ -23,6 +25,110 @@
 ### 训练与优化
 
 ### 笔记
+
+---
+
+## 计算机视觉基础知识
+
+> 相机模型、坐标系、ROS 标定消息约定等通用视觉基础。
+
+### 针孔相机与内参 K
+
+- **针孔模型**：3D 点 \((X, Y, Z)\)（相机坐标系，Z 为光轴前方）投影到像素 \((u, v)\)：
+  - \(u = f_x \cdot X/Z + c_x\)
+  - \(v = f_y \cdot Y/Z + c_y\)
+- **内参矩阵 K**（3×3，ROS `CameraInfo.K` 按行展开为 9 个数）：
+
+```
+K = [fx   0  cx]
+    [ 0  fy  cy]
+    [ 0   0   1]
+```
+
+- **maplab 标定 yaml** 中 `intrinsics.data: [fx, fy, cx, cy]`，与 K 一致。
+- ROS 相机光学坐标系：**+X 右、+Y 下、+Z 前**（与 OpenCV / RealSense 一致）。
+
+### ROS CameraInfo：K / R / P / D
+
+`sensor_msgs/CameraInfo` 是 ROS 生态里最常用的相机标定消息，四个矩阵分工如下：
+
+| 字段 | 尺寸 | 含义 |
+|------|------|------|
+| **K** | 3×3 | 内参（fx, fy, cx, cy） |
+| **D** | 向量 | 畸变系数（模型由 `distortion_model` 指定，如 plumb_bob 5 个） |
+| **R** | 3×3 | 校正旋转（rectification），把双目对齐到同一极平面 |
+| **P** | 3×4 | **投影矩阵**，综合内参 + 外参，直接做 3D→像素投影 |
+
+关系：**P = K · [R \| t]**（3×4），其中 \([R\|t]\) 把点从**校正后相机坐标系**变到像素齐次坐标。
+
+### 投影矩阵 P
+
+**定义**：3×4 矩阵，将校正后坐标系下的 3D 点 \((X, Y, Z)\) 投影为像素 \((u, v)\)：
+
+\[
+\lambda \begin{bmatrix} u \\ v \\ 1 \end{bmatrix}
+=
+\begin{bmatrix}
+f_x' & 0 & c_x' & T_x \\
+0 & f_y' & c_y' & T_y \\
+0 & 0 & 1 & 0
+\end{bmatrix}
+\begin{bmatrix} X \\ Y \\ Z \\ 1 \end{bmatrix}
+\]
+
+ROS 中 `P` 按**行优先**展开为 12 个数：`[P00, P01, P02, P03, P10, P11, P12, P13, P20, P21, P22, P23]`。
+
+**单目 / 左目（参考相机）**：无立体偏移，\(T_x = T_y = 0\)，P 退化为 K 的形式：
+
+```
+P = [fx  0  cx  0]
+    [ 0 fy  cy  0]
+    [ 0  0   1  0]
+```
+
+**右目（立体对）**：P 的第 4 列 \(T_x\) 编码**基线 baseline**（两光心水平距离），ROS/OpenCV 约定：
+
+\[
+T_x = -f_x \cdot \text{baseline}
+\qquad\Rightarrow\qquad
+\text{baseline} = -T_x / f_x
+\]
+
+右目投影公式可理解为：\(u = f_x \cdot (X - B)/Z + c_x\)，其中 B 为基线。
+
+**示例：Intel D435i 红外双目**（`camera_info.md`，640×480 rectified 流）：
+
+| 相机 | fx | P 第 4 元素 \(T_x\) | 基线 |
+|------|-----|---------------------|------|
+| infra1（左） | 392.42 | 0 | — |
+| infra2（右） | 392.42 | **-19.607** | \(-19.607 / 392.42 \approx 0.050\) m ≈ **50 mm** |
+
+```yaml
+# infra1 CameraInfo.P（行展开）
+P: [392.42, 0, 323.01, 0,  0, 392.42, 246.97, 0,  0, 0, 1, 0]
+
+# infra2 CameraInfo.P — 仅 Tx 不同
+P: [392.42, 0, 323.01, -19.607,  0, 392.42, 246.97, 0,  0, 0, 1, 0]
+```
+
+两路 `frame_id` 均为 `camera_infra1_optical_frame`，`R = I`，说明图像已 rect 到**左目光学系**；此时 K 相同、D 全 0，右目相对位姿信息集中在 P 的 \(T_x\) 里。
+
+**从 P 推 SLAM 外参**（maplab `T_B_C`）：已知左目 `T_B_C1` 和 baseline B，右目在左目右侧（+X 方向）：
+
+```
+T_C1_C2 平移 = [B, 0, 0]ᵀ   （R = I）
+T_B_C2 = T_B_C1 · T_C1_C2
+```
+
+### rectified 图像与畸变
+
+- topic 含 **`rect`**（如 `/camera/infra1/image_rect_raw`）表示驱动已做**去畸变 + 极线对齐**。
+- 此时 `D = [0,0,0,0,0]`，可当作**零畸变 pinhole**；`distortion_model: plumb_bob` 只是字段名，系数为 0。
+- 原始流（`image_raw`）通常有非零畸变，标定需区分 rect / raw。
+
+### 笔记
+
+> **来源** · 2026-09-03 · ROS CameraInfo P 矩阵与 D435i 双目 · chat: `dc42c8d2-bf63-4b72-9060-ebd0c054796b` · workspace: `slam-research`
 
 ---
 
@@ -341,3 +447,52 @@ rosbag play /data/maoli/git/fast_livo_ws/data/HKU_Cultural_Center_01.bag
 9. **总结**：2D 位姿 = 运动补偿 + 重力对齐 + Ceres 匹配；融合方式 = IMU 外推 + 扫描匹配校正
 
 > **来源** · 2026-08-31 · Cartographer 文档索引与 pipeline 概要 · chat: `04c2d32e-c80f-4e0b-bc2e-4d5bc27c3b2a` · workspace: `src`
+
+---
+
+## maplab
+
+> maplab / violoc 定位栈：坐标系约定、ROVIO 重力对齐、Unitree Go2 + D435i 工程笔记。
+
+### unitree project
+
+**工程上下文**：`maplab_ws` + `dog-violoc.launch`，标定 `d435i.yaml`，IMU topic `/camera/imu`，相机 `/camera/infra1/image_rect_raw`。
+
+**IMU / Body 坐标系（RDF，与相机光学系一致）**：
+
+- `+X`：右，`+Y`：下，`+Z`：前（右-下-前）。
+- `d435i.yaml` 中 body 基准 = IMU（`T_B_S` 单位阵），相机 `T_B_C ≈ I`，故 ROVIO 的 body/IMU 帧 ≈ D435i 光学系。
+- bag 静止段加速度计读数约 `(0.1, -9.6, 0)` m/s²，主分量在 **-Y**，与「Y 朝下、比力向上」一致；`rovio-flow.cc` 原样转发 IMU，不做轴交换。
+
+**重力对齐（ROVIO 如何保证世界系 Z-up）**——三处代码，缺一不可：
+
+1. **假设**：`ImuPrediction.hpp` 硬编码 `g_ = (0, 0, -9.81)`，世界 **+Z = 反重力（上）**。
+2. **落地**：`FilterStates::initWithAccelerometer()` 用 `qWM.setFromVectors(fMeasInit, unitZ)`，把静止加速度计测到的「上」对齐到世界 +Z（只定 roll/pitch，**yaw 不定**）。
+3. **触发**：`RovioInterfaceImplInl.hpp` 首帧 IMU、`WaitForInitUsingAccel` 时调用 `resetWithAccelerometer()`。
+
+**I 系（全局地图系）到底规定了什么**：
+
+- ✅ 明确：**+Z 朝上**（重力对齐）。
+- ❌ 未明确：水平面 +X/+Y 是「前左（FLU）」还是「右前（RDF）」；建图起点 yaw 由初始化/当时车体朝向决定，代码无「+X=车头」硬编码。
+- ROVIO 帧注释：`W` = VIO 局部系，`I` = 全局地图系，`M` = IMU 机体系；定位通过 `poseLin(0)`/`poseRot(0)`（`IrIW`/`qWI`）把 W 对齐到 I。
+
+**`$LocPose` / `att` 里 roll≈-90° 的粗略解释**：
+
+- `$LocPose`（`Update.hpp`）打印的是 **IMU(M) 在全局地图系(I) 中的位姿**：`tIM` = 位置，`att` = `qIM` 的 RPY。
+- `DCM2Euler_RPY` 注释写 FLU（x前 y左 z上），但这是**解欧拉角的数学约定**；被描述的对象仍是 **RDF 的 IMU**。
+- 相机水平朝前静止时：IMU +Y（下）对应世界 -Z（下）→ 绕 X 约 **-90° roll**；pitch≈0、yaw 才有物理航向意义。故 roll≈-90° **不是 bug**，是光学系/IMU 系相对 Z-up 世界系的固定偏置。
+- **位置** `xyz(tIM)`：地图 I 系下的水平 (x,y) + 高度 z，语义正常；不是车体 FLU 下的「前/左/上」分量。
+- 若产品输出要「静止平地 roll/pitch≈0 的 FLU 车体角」：勿改 ROVIO 内部 `g_`；在输出层用 `d435i.yaml` 的 `target_point_extrinsics` / `T_B_P`（RDF→FLU 固定旋转）得到 `T_G_P` 再解姿态。`$FusePose` 已用 `T_G_P`；`MM_Inject` 若仍从 `T_G_B` 解角会依旧显示 -90°。
+
+**相关文件**：
+
+| 主题 | 路径 |
+|------|------|
+| 重力常量 | `dependencies/internal/maplab_rovio/include/rovio/ImuPrediction.hpp` |
+| 加速度计初始化 | `dependencies/internal/maplab_rovio/include/rovio/FilterStates.hpp` |
+| RPY 工具 | `dependencies/internal/maplab_rovio/include/rovio/attitude.hpp` |
+| `$LocPose` 打印 | `dependencies/internal/maplab_rovio/lightweight_filtering/include/lightweight_filtering/Update.hpp` |
+| Unitree 标定 | `applications/maplab-node/launch/euroc/calib/d435i.yaml` |
+| RDF→FLU 输出外参 | `target_point_extrinsics` / `common/vio-common/target-point-config.h` |
+
+> **来源** · 2026-09-02 · maplab violoc IMU 系与重力对齐 · chat: `c272ab80-b4aa-4cfc-9cac-2a5e6b771b4b` · workspace: `slam-research`
