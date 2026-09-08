@@ -545,6 +545,15 @@ rosbag play /data/maoli/git/fast_livo_ws/data/HKU_Cultural_Center_01.bag
 
 > maplab / violoc 定位栈：坐标系约定、ROVIO 重力对齐、Unitree Go2 + D435i 工程笔记。
 
+### maplab console
+
+- [VIMap 数据结构与 KFH 删除非关键帧](assets/maplab_console_note.md)
+- 独立笔记涵盖 `Vertex`、`VisualNFrame` 像素 vs Landmark、`Edge`、
+  `KeypointIdentifier`、`LandmarkStore`、`LandmarkIndex`、landmark 双向观测
+  关系，以及 `removeVerticesBetweenKeyframes()` 到
+  `mergeNeighboringVertices()` 的完整链路。
+- 本次暂不整理回环检测与 landmark 合并流程。
+
 ### unitree project
 
 **工程上下文**：`maplab_ws` + `dog-violoc.launch`，标定 `d435i.yaml`，IMU topic `/camera/imu`，相机 `/camera/infra1/image_rect_raw`。
