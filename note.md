@@ -134,11 +134,102 @@ T_B_C2 = T_B_C1 · T_C1_C2
 
 ## 特征点提取和匹配
 
-> 待补充：检测器、描述子、匹配策略、几何验证。
+> SuperPoint 检测描述 + LightGlue / SuperGlue 匹配；TensorRT / 高通部署差异。
 
 ### 检测与描述
 
 ### 匹配与几何验证
+
+#### LightGlue TensorRT 部署（三实现对比）
+
+**定位（别混）**
+
+| 实现 | 是什么 |
+|------|--------|
+| **LightGlue**（`cvg/LightGlue`） | 论文原版 PyTorch 推理代码；自适应加速完整 |
+| **LightGlue-ONNX**（`fabio-sim/LightGlue-ONNX`） | 把 LightGlue 改成可导出 ONNX，再跑 ORT / TensorRT / OpenVINO；**不是**「专门用 TensorRT 重写的 LightGlue」 |
+| **本仓库导出器** `convert_lightglue_to_onnx.py` | 基于 LightGlue-ONNX 的 matcher-only，再改成现有 C++ SuperGlue ABI + TRT 8.5 |
+
+数据流：图像 → **现有 SuperPoint** → 关键点+256维描述子 → LightGlue matcher。`superpoint_lightglue.pth` 只是「适配 SuperPoint 描述子的 matcher 权重」，不含 SuperPoint 网络。
+
+产物：`dependencies/internal/superpoint-superglue/weights/fast_feature_matcher.onnx`（已核实 **9 层**，`transformers.0`…`8`，assignment 用 `log_assignment.8`）。C++：`light_glue.cpp` / `spsg_wrapper.cpp`。
+
+**「层」不是 CNN feature map**
+
+LightGlue 不卷积图像、不改变分辨率。每层是一组 **Transformer：self-attention + cross-attention**，在 **同一批关键点 token** 上反复更新 256 维描述子。800 个点进、800 个点出，没有「前面分辨率高、后面分辨率低」。
+
+官方默认 9 层（不是 11；checkpoint 只有 9 层权重，设 11 会因 `strict=False` 多出随机层）：
+
+```python
+# LightGlue/lightglue/lightglue.py
+"n_layers": 9,
+```
+
+本仓库导出：`--n_layers` 传给 `LightGlueMatcher`；已把 argparse 默认改成 9。`LightGlueMatcher.__init__` 里函数默认仍写 `n_layers: int = 6`，但 `main()` 会传入 `args.n_layers`，以命令行/argparse 为准。
+
+```python
+# convert_lightglue_to_onnx.py forward
+for i in range(lg.n_layers):
+    layer = lg.transformers[i]
+    d0 = layer.self_attn(d0, enc0)
+    d1 = layer.self_attn(d1, enc1)
+    d0, d1 = _cross_block(layer.cross_attn, d0, d1)
+scores = _match_assignment(lg.log_assignment[lg.n_layers - 1], d0, d1)
+```
+
+6 层可用（deep supervision 让中间层 assignment 也训练过），但困难图对匹配数会掉；最终 ONNX 用满 9 层。
+
+**对比表**
+
+| 点 | 通俗逻辑 | LightGlue | LightGlue-ONNX | 本仓库 `convert_lightglue_to_onnx.py` |
+|----|----------|-----------|----------------|----------------------------------------|
+| 输入 | matcher 吃点，不吃图 | 两图 keypoints + descriptors + image_size | 默认端到端：`images` → SuperPoint+matcher；也可 matcher-only | **仅 matcher**：`image0_size/image1_size` + kp/desc；SuperPoint 仍是独立 engine |
+| 层数 | Transformer 堆叠次数，非特征图尺度 | 默认 9；可用 `--n_layers` 减层换速度 | 默认 9，固定跑完 | 默认现为 9；产物 ONNX 已是 9 层 |
+| Adaptive depth | 简单图对提前停层 | 开，`depth_confidence=0.95` | **关**（forward 无 break） | **关**（`-1`） |
+| Adaptive width | 后面几层丢掉「确定匹配不上」的点，降 attention 的 N² | 开，`width_confidence=0.99` | **关** | **关** |
+| FlashAttention / compile | PyTorch CUDA 算子加速，数学不变 | `flash=True`，`torch.compile` | 导出用 SDPA；fused MHA 标 **ORT-only**，TRT 自己融子图 | `F.scaled_dot_product_attention`；TRT 8.5 能否融合看后端 |
+| Assignment | SuperGlue 是多轮 Sinkhorn；LightGlue 是相似度+matchability+双向 softmax | 轻量头，无 Sinkhorn | 同左 | 同左，但改成 **双流** `d0/d1`，去掉 `0::2` slice |
+| 两边点数 | query N0 vs base N1 | 可不等 | 堆成 `(2B,N,*)`，一般要求 N0=N1 | **dual-tensor**，允许 N0≠N1 |
+| 输出 | K=有效匹配数 | dense `matches0[N0]` + 稀疏列表 | `matches[K,3]`、`mscores[K]`，**K 动态** | dense：`matches0[1,N0]` int32，无匹配填 **-1**；buffer 长度=N0，K 在 C++ 过滤 |
+| 图像尺寸 | 只用于把像素坐标归一化到 [-1,1] 附近，shape 恒为 `[1,2]` | 两图可不同 | 可不同 | 支持不同；config 默认 query 536×960、db 648×864 |
+| 部署目标 | | PyTorch CUDA | ORT / TRT / OpenVINO / FP8 | **TRT 8.5 C++**（opset 16，避免 LayerNorm op） |
+
+**输出为何不是 `matches[K,3]`**
+
+图内对每个 query 点写一个槽位：`valid` 则写匹配下标，否则 `-1`。C++ `light_glue.cpp` 按 `m=N0` 读满 buffer，再 `if (j < 0) continue` 得到长度为 K 的 `cv::DMatch`。高通若卡在「动态输出 K」，当前设计已避开；真正难的是 **输入 N0/N1 动态**（attention 中间张量 `[N0,N1]` 变）。
+
+**原版加速 vs 部署能留下什么**
+
+| 优化 | 原版 | ONNX/TRT/高通 |
+|------|------|----------------|
+| 提前停层 / 逐层砍点 | 有 | 控制流+动态 Gather，导出图里关掉 |
+| 无 Sinkhorn 的 assignment | 有 | **保留** |
+| 固定减层（9→6） | 可选 | 可选；本仓库最终仍用 9 |
+| Flash / `torch.compile` | 有 | 不随 ONNX 带走；靠 TRT/QNN 融合与 FP16 |
+
+**TensorRT 坑（已修）**
+
+TRT 8.5 把 ONNX int64 输出静默写成 int32。C++ 若按 `int64_t*` 读，小端会把相邻两个 int32 拼成一个 int64，自匹配出现 **d≈2q**。现导出 `.to(torch.int32)`，C++ 用 `int32_t*`。
+
+另一坑：LightGlue-ONNX 的 batch 维 swap + `[0::2]` 在 TRT 8.5 会算错；本仓库改 dual-tensor。
+
+**高通 8550**
+
+- 动态 **N0/N1**：HTP 常要静态 shape；可固定点数 + pad（必须 mask，否则假点污染 attention）。
+- 动态 **K**：当前 dense 输出已不需要。
+- 两图 **WxH 不同**：matcher 只吃两个 `[1,2]` 数值，不是动态 shape。若高通失败，更像常量折叠/只传一个 size/SuperPoint 图尺寸锁死。
+- 不要为对齐尺寸把两图 **非等比** `cv::resize` 到 536×864。`cv::resize(src, dst, Size(W,H))` 是独立 `sx/sy`。更稳：letterbox（等比缩放 + **黑边 pad=0**）+ 丢掉 pad 区关键点 + 坐标/内参逆变换。
+
+**相关路径**
+
+- 官方：`LightGlue/lightglue/lightglue.py`
+- ONNX 上游：`LightGlue-ONNX/lightglue_dynamo/models/lightglue.py`
+- 导出：`dependencies/internal/superpoint-superglue/convert2onnx/convert_lightglue_to_onnx.py`
+- 本地拷贝：同目录 `_lightglue_onnx.py`
+- TRT C++：`.../src/light_glue.cpp`
+- 计划：`.ai/plans/zh-CN/24-lightglue-onnx-export-boundary.md`、`25-lightglue-trt-int32-fix.md`
+
+> **来源** · 2026-09-06 · LightGlue TensorRT 三实现对比 · chat: `c9ffa037-2426-4c4f-9773-3785ea0be8e4` · workspace: `rob_slam-research`
 
 ### 笔记
 
