@@ -547,12 +547,11 @@ rosbag play /data/maoli/git/fast_livo_ws/data/HKU_Cultural_Center_01.bag
 
 ### maplab console
 
-- [VIMap 数据结构与 KFH 删除非关键帧](assets/maplab_console_note.md)
+- [VIMap 数据结构、KFH、DL summary map](assets/maplab_console_note.md)
 - 独立笔记涵盖 `Vertex`、`VisualNFrame` 像素 vs Landmark、`Edge`、
-  `KeypointIdentifier`、`LandmarkStore`、`LandmarkIndex`、landmark 双向观测
-  关系，以及 `removeVerticesBetweenKeyframes()` 到
-  `mergeNeighboringVertices()` 的完整链路。
-- 本次暂不整理回环检测与 landmark 合并流程。
+  `KeypointIdentifier`、`LandmarkStore`、`LandmarkIndex`、KFH 删除链路，
+  以及 **DL localization summary map**（observer、像素、无 landmark 反向表）。
+- 暂不整理回环检测、landmark 合并、以及 summary 的 Binary 通道。
 
 ### unitree project
 

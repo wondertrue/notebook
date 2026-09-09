@@ -1,7 +1,8 @@
 # Maplab Console 笔记
 
-本文记录 `maplab_console` 后处理过程中涉及的 VIMap 数据结构，以及
-`kfh` 删除非关键帧 vertex 的执行链路。回环检测与 landmark 合并暂不纳入。
+本文记录 `maplab_console` 后处理过程中涉及的 VIMap 数据结构、`kfh`
+删除非关键帧，以及导出 **localization summary map 的 DL 部分**（不写 Binary/BRISK）。
+回环检测与 landmark 合并暂不纳入。
 
 ## 关键数据结构
 
@@ -196,3 +197,65 @@ landmark 或 edge 关系。
   `p_B` 和观测 backlink。
 
 > **来源** · 2026-09-08 · Maplab Console 数据结构与 KFH · chat: `51785407-f840-4bff-bf7a-47dc01e3a042` · workspace: `rob_slam-research`
+
+## DL Localization Summary Map
+
+Console 的 `generate_summary_map_and_save_to_disk` 把 VIMap **压成定位库**，
+**不再**使用完整 `Vertex` / `Landmark` / `LandmarkIndex`。下文只记 **DL 通道**
+（SuperPoint 点描述子 + 全局 image descriptor + 像素），不记 Binary。
+
+Proto 入口：`LocalizationSummaryMap.uncompressed_map` 里带 `deep_learning_*` /
+`image_descriptors` / `ObservedLandmarks` 等字段。
+
+### 存了什么（相对 VIMap）
+
+| VIMap | Summary DL |
+|-------|------------|
+| `Landmark.p_B` + store vertex pose | 直接存全局 `G_dl_landmark_position`（3×N） |
+| `VisualFrame` 描述子 | `dl_point_descriptors_`（如 256×N SuperPoint）+ `dl_point_scores_` |
+| `VisualFrame` 像素 | 见下：按 observer 存 2×K 的 `(u, v)` |
+| 完整 NFrame / 图像 | 默认不存；可选 JPEG（`--lc_save_db_images_to_summary_map`） |
+| Vertex 位姿 | `G_dl_observer_pose_`：7×N，`p_CinG(x,y,z)` + `q_CtoG(qw,qx,qy,qz)` |
+| 全局描述 | 每 observer 一列 `dl_image_descriptors_`（VPR，如 Megaloc） |
+| `Landmark.observations_` | **不存**；观测按 observer 正向组织 |
+
+另有每 landmark 的观测 yaw/距离统计（mean/range），给带位姿先验的检索用。
+
+运行时另有 `dl_landmark_id_to_landmark_index_`、`dl_vertex_id_to_index_`
+及其反向 vector，是 **整数列下标**，不是 VIMap 的 store vertex。
+
+### 像素怎么表达
+
+按 **observer（帧）** 存，不是挂在 landmark 实体上：
+
+```protobuf
+message ObservedLandmarks {
+  required uint32 observer_index = 1;
+  repeated uint32 landmark_indices = 2;
+  repeated float keypoints = 3;  // 平铺 (u,v)，长度 = 2 * landmark_indices
+}
+```
+
+内存：`landmark_keypoints` 为 `Eigen::Matrix<float, 2, Dynamic>`，每列 `(u, v)`，
+与 `landmark_indices` 列对齐。创建时从 VIMap
+`VisualFrame.getKeypointMeasurement(keypoint_index)` 拷出。
+
+定位时 `extractFrameFromSummaryMap` 读这两列，填 LightGlue 的 database
+`keypoints2`。
+
+### Observer 与 Vertex
+
+- 创建时用 `VisualFrameIdentifier = (vertex_id, frame_index)` 去重，赋连续
+  `observer_index`。
+- **单目**：一个 vertex 通常一个 observer，可把 observer 当成「关键帧」。
+- **多目**：同一 vertex 的 cam0/cam1 是 **两个** observer。
+- Observer 不是完整 pose-graph `Vertex`（无 IMU、无 LandmarkStore、无边）。
+
+### 查找方向
+
+- **observer → landmarks**：直接读
+  `dl_landmarks_observations[k].landmark_indices`（及对齐的像素）。
+- **landmark → observers**：没有 `Landmark.observations_` 反向表；只能扫所有
+  `ObservedLandmarks` 看 `landmark_indices` 是否含该列下标。
+
+> **来源** · 2026-09-09 · DL summary map 结构与像素 · chat: `51785407-f840-4bff-bf7a-47dc01e3a042` · workspace: `rob_slam-research`
