@@ -37,6 +37,7 @@
   - [Cartographer](#cartographer)
 - [maplab](#maplab)
   - [maplab console](#maplab-console)
+  - [slam_node vertex 时间轴](#slam_node-vertex-时间轴)
   - [unitree project](#unitree-project)
 
 ---
@@ -622,6 +623,30 @@ rosbag play /data/maoli/git/fast_livo_ws/data/HKU_Cultural_Center_01.bag
   `KeypointIdentifier`、`LandmarkStore`、`LandmarkIndex`、KFH 删除链路，
   以及 **DL localization summary map**（observer、像素、无 landmark 反向表）。
 - 暂不整理回环检测、landmark 合并、以及 summary 的 Binary 通道。
+
+### slam_node vertex 时间轴
+
+VI-Map **vertex 时间基准是图像 NFrame，不是 odometry**。`slam_odom_T_M_I` 只提供轨迹采样，在 `t_image` 上插值得到 vertex pose；每条 odometry **不**创建 vertex。
+
+```cpp
+// applications/maplab-node/src/mapping/map-update-builder.cc
+const int64_t timestamp_nframe_ns =
+    tracked_nframe->nframe->getMinTimestampNanoseconds();
+T_M_B_buffer_.interpolateViNodeStateAt(
+    timestamp_nframe_ns, &(map_update->vinode));
+```
+
+三条时间轴各自保留原始 stamp，靠插值关联：
+
+| 轴 | 作用 |
+|----|------|
+| `t_img` | 创建 vertex；SPSG / image descriptor 按最近 vertex 挂载（tolerance 默认 0.5 ms） |
+| `t_odom` | 写入 `PoseLookupBuffer`，给任意 `t_img` / `t_lidar` 插值 |
+| `t_lidar` | sensor resource（scan-end）；不必等于 `t_img`/`t_odom`；导出时在 `t_lidar` 插值 `T_G_L` |
+
+odometry 比图像多（例如 ImgUpdate + LidarUpdate 都发 odom → ~20 Hz）是正常的：多出来的样本只加密插值，不产生空 vertex，也不要求对应 descriptor。
+
+> **来源** · 2026-09-17 · VI-Map vertex 时间轴 · chat: `0c3a2617-73a2-4612-8a0d-dde0addcf7c0` · workspace: `rob_slam-research`
 
 ### unitree project
 
