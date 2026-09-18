@@ -31,6 +31,7 @@
   - [笔记](#笔记-4)
 - [建图和定位](#建图和定位)
   - [GOReloc](#goreloc)
+  - [FAST-LIO](#fast-lio)
   - [FAST-LIVO2](#fast-livo2)
   - [perception_oru NDT（D2D vs P2D）](#perception-oru-ndtd2d-vs-p2d)
   - [Cartographer](#cartographer)
@@ -380,6 +381,49 @@ for area in bpy.context.screen.areas:
 - **融合方式**：在关键帧上，取落在 YOLO bbox 范围内的所有 ORB MapPoints（`kf->GetFeaturesInBox`），归属给对应 Object，用于拟合椭球体形状（`OptimizeReconstructionQuat`）。ORB 负责几何定位，YOLO 负责语义标注，二者互补。
 
 > **来源** · 2026-08-30 · GOReloc 建图定位系统解析 · chat: `a1c26f79-dfe0-40cf-8152-ff92606389c1` · workspace: `GOReloc`
+
+### FAST-LIO
+
+**FAST-LIO**（Fast LiDAR-Inertial Odometry）——港大 Mars Lab 激光-惯性紧耦合里程计；本仓库以 **Livox MID360** + IMU 为主（`lidar_type: 1` → `avia_handler()`）。
+
+**工作空间**：`/data/maoli/git/fast_livo_ws`（包路径 `src/FAST_LIO`）
+
+**主文档**：
+
+| 文档 | 路径 | 说明 |
+|------|------|------|
+| pipeline.md | `/data/maoli/git/fast_livo_ws/src/FAST_LIO/pipeline.md` | MID360 + bag `recording_20250918_083637`：驱动/消息、时间同步、IMU+ESKF、ikd-Tree 点到面、外参、RViz/PCD、排查与命令 |
+
+**常用配置 / launch**（详见 pipeline §12）：
+
+| 场景 | 配置 | launch |
+|------|------|--------|
+| MID360 + Livox 内置 IMU | `config/mid360.yaml` | `mapping_mid360.launch` |
+| MID360 + RealSense `/camera/imu` | `config/mid360_cam.yaml` | `mapping_mid360_cam.launch` |
+| LI-Init 标定 | `LiDAR_IMU_Init/config/mid360*.yaml` | `livox_mid360*.launch` |
+
+**pipeline.md 章节概要**：
+
+1. **一句话理解**：IMU 传播 → 去畸变 → 体素降采样 → ikd-Tree 近邻 → 点到面残差 → **迭代 ESKF** → 增量地图
+2. **ROS 驱动与消息**：`livox_ros_driver2`、本仓最小消息包 vs 官方驱动、CustomMsg 字段、MID360 vs Velodyne、`scan_line: 4`
+3. **数据接收与时间同步**：回调、`sync_packages`、`time_offset_lidar_to_imu` 符号约定
+4. **IMU 初始化、积分与去畸变**：`IMU_init` / `UndistortPcl`、`curvature` 存点时间
+5. **LiDAR 迭代 EKF 量测**：scan-to-map（非帧间 ICP）、`h_share_model`
+6. **外参在线估计**：当前 `extrinsic_est_en: false`（用 LI-Init 固定外参）
+7. **输出、RViz 与 PCD**：`/cloud_registered` vs ikd-Tree；`pcd_save` → `FAST_LIO/PCD/scans.pcd`（世界系 `camera_init`，`interval: -1` 单文件）
+8. **RViz 圆环/散点**：MID360 扫描纹理、`currPoints` 累积、自反射 `blind`、时间/外参
+9. **排查顺序**：暂停 bag、`surround` vs `currPoints`、`point_filter_num` / `blind`
+10. **关键代码索引**：`preprocess.cpp`、`laserMapping.cpp`、`IMU_Processing.hpp`、`ikd-Tree`
+11. **不包含**：回环、全局 PGO、重定位、PCD 闭环校正
+12. **回放验证命令**：LI-Init / FAST-LIO（Livox IMU 与 camera IMU）
+
+**PCD 在 CloudCompare 中上色**（`mid360_cam` 存盘同理，无相机 RGB）：
+
+- 点类型 `PointXYZINormal`；有意义标量主要是 **`intensity`**（Livox `reflectivity`）
+- Colors 选 **Scalar field** 且激活 `intensity` → 反射率；默认 Jet 色条一般为 **蓝=低、红=高**
+- `normal_*`、`curvature` 在 FAST-LIO 存盘路径中多为 0，勿当几何法向使用
+
+> **来源** · 2026-09-15 · FAST-LIO pipeline 文档索引与 PCD 着色 · chat: `a7612123-be1e-4918-af7d-88cffee70d53` · workspace: `fast_livo_ws`
 
 ### FAST-LIVO2
 
