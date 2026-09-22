@@ -38,6 +38,7 @@
 - [maplab](#maplab)
   - [maplab console](#maplab-console)
   - [slam_node vertex 时间轴](#slam_node-vertex-时间轴)
+  - [建图同步与 LiDAR 时间对齐](#建图同步与-lidar-时间对齐)
   - [unitree project](#unitree-project)
 
 ---
@@ -647,6 +648,82 @@ T_M_B_buffer_.interpolateViNodeStateAt(
 odometry 比图像多（例如 ImgUpdate + LidarUpdate 都发 odom → ~20 Hz）是正常的：多出来的样本只加密插值，不产生空 vertex，也不要求对应 descriptor。
 
 > **来源** · 2026-09-17 · VI-Map vertex 时间轴 · chat: `0c3a2617-73a2-4612-8a0d-dde0addcf7c0` · workspace: `rob_slam-research`
+
+### 建图同步与 LiDAR 时间对齐
+
+#### Vertex 与图像派生测量
+
+- VI-Map vertex 由经过跟踪的 `VisualNFrame` 创建；不是因为 SPSG/VPR 输入图像才创建。SPSG external features 和 VPR image descriptor 是附加到既有 vertex 的图像派生测量。
+
+```cpp
+// map-update-builder.cc: VisualNFrame 决定 MapUpdate 的时间戳，
+// odom 状态被插值到该图像时刻。
+const int64_t timestamp_nframe_ns =
+    tracked_nframe->nframe->getMinTimestampNanoseconds();
+T_M_B_buffer_.interpolateViNodeStateAt(
+    timestamp_nframe_ns, &(map_update->vinode));
+map_update->keyframe = tracked_nframe;
+
+// stream-map-builder.cc: MapUpdate 中的 NFrame 被放进新 vertex。
+vi_map::Vertex* map_vertex = new vi_map::Vertex(
+    vertex_id, vinode_state.getImuBias(), nframe, invalid_landmark_ids,
+    mission_id_);
+map_vertex->set_T_M_I(vinode_state.get_T_M_I());
+map_->addVertex(vi_map::Vertex::UniquePtr(map_vertex));
+```
+
+- 两类附加测量必须保留源图像的 `header.stamp`，再按最近 vertex 挂载。当前容差取 `vio_nframe_sync_tolerance_ns = 500000 ns`（0.5 ms），其用途是容纳同一帧的微小时间误差，不允许跨相机帧匹配。
+
+#### Mapping Synchronizer 的驱动关系
+
+- `Synchronizer::processOdometryMeasurement()` 每收到一条 odom，先写入 `T_M_B_buffer_`，随后调用 `releaseData()`；因此 **odom 是数据释放的驱动源**，但 vertex 仍由图像 NFrame 创建。
+
+```cpp
+// synchronizer.cc
+DEFINE_int64(
+    odometry_buffer_history_ns, aslam::time::seconds(30u),
+    "History length of the buffered external 6DOF odometry measurements.");
+
+void Synchronizer::processOdometryMeasurement(
+    const vio::ViNodeState& odometry) {
+  T_M_B_buffer_.bufferOdometryEstimate(odometry);
+  releaseData();
+}
+```
+
+- `odometry_buffer_history_ns = 30 s` 是**已收到 odom 的历史保留长度**。领先当前最新 odom 的 LiDAR 会留在 LiDAR buffer 等待，Synchronizer 没有单独的 wall-clock 等待超时；持续收到更新 LiDAR 时，旧数据会因 `30 s` 时间跨度或超过 `256 scans` 被淘汰。更上游的 Go2 `lidar_resource_node` 另有 `max_wait_s: 2.0`，用于等待一帧 scan 所需的 IMU/odom 覆盖。
+- 可释放 pose 窗口是 IMU 与 odom 可用区间的交集：
+  - `oldest = max(oldest_odom, oldest_imu)`
+  - `newest = min(newest_odom, newest_imu)`
+- camera、LiDAR 等测量小于 `oldest` 时因无法恢复 pose 而丢弃；时间戳不大于 `newest` 时释放；大于 `newest` 时继续等待后续 IMU/odom。
+- LiDAR 不要求靠近图像或 vertex。`synchronizer_lidar_buffer_length_ns = 30 s` 和 `synchronizer_lidar_buffer_max_scans = 256` 只是缓存保护，不是 LiDAR-image 同步容差。
+
+#### LiDAR 去畸变、存图与 console 放置
+
+1. `lidar_resource_node` 使用覆盖整帧 `[scan_begin, scan_end]` 的 IMU，并把 odom 插值到 `scan_end`；随后将每个点从自己的采样时刻补偿到 `L(scan_end)`。输出点云时间戳为 `scan_end`。
+2. `slam_node` 将该点云按 LiDAR sensor ID 和 `scan_end` 保存为 **mission 级 temporal sensor resource**。它不附着在任何 vertex 上，也不是 vertex 的 frame resource：
+
+```cpp
+// stream-map-builder.h
+map_->addSensorResource(
+    point_cloud_type, lidar_sensor_id, timestamp_ns, point_cloud, &mission);
+
+// vi-map-inl.h
+mission->addSensorResourceId(
+    type, sensor_id, resource_id, timestamp_ns);
+```
+
+3. console 导出或显示时，`PoseInterpolator` 从相邻 vertex 状态出发，沿 VIWLS IMU edge 使用 `ImuIntegratorRK4` 积分到点云自己的 `t_lidar`，得到连续位姿 `T_M_B(t_lidar)`。
+4. 点云最终按下式放入全局地图：
+
+\[
+p_G = T_{G\_M}\,T_{M\_B}(t_{lidar})\,T_{B\_L}\,p_{L(scan\_end)}
+\]
+
+- 这里是“在 LiDAR 时间戳计算 pose”，不是“把 LiDAR 转到对应 vertex 时间戳”。只要求 `t_lidar` 落在 VIWLS 轨迹可插值范围内；范围外的资源会跳过。
+- 后端优化后的 vertex 状态会改变 scan 的全局刚体放置；但帧内去畸变仍使用建图在线阶段的 IMU/odom，不会在 console 中按优化轨迹重新逐点去畸变。
+
+> **来源** · 2026-09-18 · 建图同步与 LiDAR 时间对齐 · chat: `403b0ae0-d528-4872-992e-14a0dbf8e9c5` · workspace: `rob_slam-research`
 
 ### unitree project
 
