@@ -38,6 +38,7 @@
 - [maplab](#maplab)
   - [maplab console](#maplab-console)
   - [slam_node vertex 时间轴](#slam_node-vertex-时间轴)
+  - [PoseLookupBuffer 与 IMU 前向积分](#poselookupbuffer-与-imu-前向积分)
   - [建图同步与 LiDAR 时间对齐](#建图同步与-lidar-时间对齐)
   - [unitree project](#unitree-project)
 
@@ -648,6 +649,44 @@ T_M_B_buffer_.interpolateViNodeStateAt(
 odometry 比图像多（例如 ImgUpdate + LidarUpdate 都发 odom → ~20 Hz）是正常的：多出来的样本只加密插值，不产生空 vertex，也不要求对应 descriptor。
 
 > **来源** · 2026-09-17 · VI-Map vertex 时间轴 · chat: `0c3a2617-73a2-4612-8a0d-dde0addcf7c0` · workspace: `rob_slam-research`
+
+### PoseLookupBuffer 与 IMU 前向积分
+
+`vio_common::PoseLookupBuffer`（`common/vio-common/src/pose-lookup-buffer.cc`）在 buffer 内 odometry 时间序列上为任意时刻取 `ViNodeState` / `T_M_I`。**`interpolateViNodeStateAt`** 是建图主入口（`MapUpdateBuilder`）；定位 **`rob_slam_loc`** 用的是同类的 **`getPoseAt`**（`RovioLocalizationHandler::T_M_I_buffer_`），逻辑与下面「向前 IMU 分支」对称，但 violoc **不调用** `interpolateViNodeStateAt`。
+
+**`interpolateViNodeStateAt` 决策顺序（易记：不是「超 500 ms 才 RK4」）**
+
+1. buffer 空 / 请求时刻早于最老样本 → 失败（`kFailedNotYetAvailable` / `kFailedWillNeverSucceed`）。
+2. **`buffer_odometry_estimate_.interpolateAt` 成功** → 相邻两帧 odometry 之间 **线性插值位姿 + slerp 四元数**（`interpolateTransformation`），**不用 RK4**；返回 `kSuccessInterpolated`。
+3. 插值失败且 **`timestamp_ns` 晚于 buffer 最新 odometry**（需向前补）：
+   - 令 `Δt = timestamp_ns - t_newest`。
+   - **若 `Δt > max_allowed_propagation_time_ns_`** → **`kFailedNotYetAvailable`，不做 IMU 积分**。
+   - **若 `Δt ≤ max_allowed_propagation_time_ns_`** → 调用 **`vio::propagatePoseUsingImu`**（`imu-forward-propagation.cc`），内部 **`imu_integrator::ImuIntegratorRK4::integrateStateOnly`** 逐步积分；返回 `kSuccessImuForwardPropagation`。积分后四元数 **未** 在 buffer 层做 `normalize()`。
+
+**500 ms 上限从哪里来**
+
+| 用途 | 构造处 | 默认值 |
+|------|--------|--------|
+| **建图** `Synchronizer::T_M_B_buffer_` | `synchronizer.cc` 传入 gflag | **`--odometry_buffer_max_forward_propagation_ns`**，默认 **`aslam::time::milliseconds(500)`（0.5 s）** |
+| **定位** `RovioLocalizationHandler::T_M_I_buffer_` | `rovio-localization-handler.h` | 编译期 **`kBufferMaxPropagationNs = aslam::time::milliseconds(500)`**，无 gflag |
+
+建图 gflag 定义：
+
+```cpp
+// applications/maplab-node/src/mapping/synchronizer.cc
+DEFINE_int64(
+    odometry_buffer_max_forward_propagation_ns, aslam::time::milliseconds(500),
+    "Determines the maximum duration the odometry buffer can "
+    "forward-propagate using the IMU.");
+```
+
+**相关调用**
+
+- 建图：`T_M_B_buffer_.interpolateViNodeStateAt(t_nframe, &map_update->vinode)`（见上节 `map-update-builder.cc`）。
+- 定位：`T_M_I_buffer_.getPoseAt(loc_ts, &T_M_I)` → 重力门控 / `T_G_I` / MM 注入等（**不再**二次 lookup）。
+- **`getRotationBetween`**（特征跟踪帧间旋转）：只用 IMU 陀螺积分，**不走** `max_allowed_propagation_time_ns_` 上限。
+
+> **来源** · 2026-09-22 · PoseLookupBuffer 500 ms 与 RK4 分支 · chat: `eb882abe-dff4-4ed5-93dc-38f3d903199d` · workspace: `rob_slam-research`
 
 ### 建图同步与 LiDAR 时间对齐
 
