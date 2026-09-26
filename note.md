@@ -40,6 +40,7 @@
   - [slam_node vertex 时间轴](#slam_node-vertex-时间轴)
   - [PoseLookupBuffer 与 IMU 前向积分](#poselookupbuffer-与-imu-前向积分)
   - [建图同步与 LiDAR 时间对齐](#建图同步与-lidar-时间对齐)
+  - [ROVIO LiDAR Jacobian、信息矩阵与虚拟量测](#rovio-lidar-jacobian信息矩阵与虚拟量测)
   - [unitree project](#unitree-project)
 
 ---
@@ -763,6 +764,112 @@ p_G = T_{G\_M}\,T_{M\_B}(t_{lidar})\,T_{B\_L}\,p_{L(scan\_end)}
 - 后端优化后的 vertex 状态会改变 scan 的全局刚体放置；但帧内去畸变仍使用建图在线阶段的 IMU/odom，不会在 console 中按优化轨迹重新逐点去畸变。
 
 > **来源** · 2026-09-18 · 建图同步与 LiDAR 时间对齐 · chat: `403b0ae0-d528-4872-992e-14a0dbf8e9c5` · workspace: `rob_slam-research`
+
+### ROVIO LiDAR Jacobian、信息矩阵与虚拟量测
+
+#### Jacobian、Hessian 与信息矩阵
+
+设原始残差为 \(r\)，对 6DoF pose 的 Jacobian 为 \(H\)，量测噪声 covariance
+为 \(R\)。用 \(R^{-1/2}\) 白化：
+
+\[
+l=R^{-1/2}r,\qquad J=R^{-1/2}H.
+\]
+
+白化后噪声 covariance 为 \(I\)。当前代码累计：
+
+\[
+HtH=J^\mathsf TJ=H^\mathsf TR^{-1}H,
+\]
+\[
+Htl=J^\mathsf Tl=H^\mathsf TR^{-1}r,\qquad
+ltl=l^\mathsf Tl.
+\]
+
+- \(J\) 是 Jacobian，约为“点数 × 6”。
+- \(HtH\) 是 Gauss-Newton 近似 Hessian，也是该批量测对 pose 提供的
+  **information matrix**。
+- 信息矩阵不是 Jacobian；一般量测信息为 \(H^\mathsf TR^{-1}H\)，状态 prior
+  信息矩阵为 \(P^{-1}\)。
+
+#### 为什么同时需要 \(P_{pp}\) 和 \(P_{xp}\)
+
+- \(P_{pp}\)：pose 相对 pose 的 6×6 covariance，用于创新 covariance：
+  \[
+  P_y=I+B P_{pp}B^\mathsf T.
+  \]
+- \(P_{xp}\)：完整状态相对 pose 的交叉 covariance，尺寸为“完整状态维数 × 6”，
+  用于 Kalman gain：
+  \[
+  K=P_{xp}B^\mathsf TP_y^{-1}.
+  \]
+
+LiDAR 只直接观测 pose；\(P_{xp}\) 将这份信息传给 velocity、gyro/accel bias
+等相关状态。若只更新 pose，\(P_{xp}\) 对应的 pose 行就是 \(P_{pp}\)；若使用
+完整状态 Jacobian，则 \(P_{xp}\) 隐含在 \(P H_{\text{full}}^\mathsf T\) 中。
+
+#### 为什么不能直接把 \(HtH/Htl\) 当作 \(H/r\)
+
+若白化后的原始模型为：
+
+\[
+l=J\delta p+e,\qquad e\sim\mathcal N(0,I),
+\]
+
+左乘 \(J^\mathsf T\) 后：
+
+\[
+Htl=HtH\,\delta p+\eta,\qquad
+\operatorname{Cov}(\eta)=HtH.
+\]
+
+因此把 `Htl` 当作 6 维虚拟残差时，正确形式是
+\(H_v=HtH,\ R_v=HtH\)，不是 \(R_v=I\)：
+
+- 错用 \(H_v=HtH,\ R_v=I\) 会把信息再次平方为 \(HtH^2\)，信息向量变成
+  \(HtH\cdot Htl\)。
+- 使用 \(H_v=HtH,\ R_v=HtH\) 虽然理论等价，但退化环境中 `HtH` 会降秩；
+  \(HtH\,P_{pp}\,HtH+HtH\) 与 `HtH` 具有相同零空间，无法做正定 LLT。
+
+#### 特征分解构造标准虚拟量测
+
+当前 `ConstructVirtualMeasurement()` 对称特征分解：
+
+\[
+HtH=V\Lambda V^\mathsf T.
+\]
+
+对每个机器精度以上的正特征值 \((\lambda_i,v_i)\)，构造：
+
+\[
+B_i=\sqrt{\lambda_i}\,v_i^\mathsf T,\qquad
+y_i=\frac{v_i^\mathsf T Htl}{\sqrt{\lambda_i}}.
+\]
+
+于是：
+
+\[
+B^\mathsf TB=HtH,\qquad B^\mathsf Ty=Htl,
+\]
+
+并可使用单位噪声的标准 measurement-form Kalman 更新：
+
+\[
+P_y=I+B P_{pp}B^\mathsf T,
+\]
+\[
+K=P_{xp}B^\mathsf TP_y^{-1},
+\]
+\[
+\delta x=d-K(y+Bd),\qquad
+P^+=P^--K P_yK^\mathsf T.
+\]
+
+特征分解的主要目标是从 normal equations 构造等价的 `B/y` 虚拟量测，以复用
+标准 Kalman 公式；`HtH` 降秩时 `B` 行数减少只是自然结果。LLT 分解作用于始终含
+单位阵的 \(P_y\)，不是作用于可能降秩的 `HtH`。
+
+> **来源** · 2026-09-26 · ROVIO LiDAR 信息矩阵与虚拟量测 · chat: `7c120f61-7bc0-40f4-b8c4-d74a774d3ad0` · workspace: `rob_slam-research`
 
 ### unitree project
 
