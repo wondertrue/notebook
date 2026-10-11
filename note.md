@@ -42,6 +42,9 @@
   - [建图同步与 LiDAR 时间对齐](#建图同步与-lidar-时间对齐)
   - [ROVIO LiDAR Jacobian、信息矩阵与虚拟量测](#rovio-lidar-jacobian信息矩阵与虚拟量测)
   - [unitree project](#unitree-project)
+- [Docker](#docker)
+  - [docker run](#docker-run)
+  - [docker exec](#docker-exec)
 
 ---
 
@@ -913,3 +916,69 @@ P^+=P^--K P_yK^\mathsf T.
 | RDF→FLU 输出外参 | `target_point_extrinsics` / `common/vio-common/target-point-config.h` |
 
 > **来源** · 2026-09-02 · maplab violoc IMU 系与重力对齐 · chat: `c272ab80-b4aa-4cfc-9cac-2a5e6b771b4b` · workspace: `slam-research`
+
+---
+
+## Docker
+
+> 常用的权限、目录挂载、RViz 显示和 GPU 选择参数。
+
+### docker run
+
+更灵活的选择是：创建容器时用 `--gpus all` 暴露所有 GPU，执行训练或推理任务时再用 `CUDA_VISIBLE_DEVICES` 指定 GPU。这样长期容器切换 GPU 时不需要删除或重建。
+
+示例：以宿主机 UID/GID 运行、挂载 `/data/maoli`、支持 RViz，并暴露所有 GPU：
+
+```bash
+docker run -it \
+  --gpus all \
+  --user 1000:1000 \
+  -e HOME=/home/maoli \
+  -e DISPLAY="$DISPLAY" \
+  -e XAUTHORITY=/tmp/.docker.xauth \
+  -e QT_X11_NO_MITSHM=1 \
+  -v /data/maoli:/data/maoli \
+  -v "$XAUTHORITY:/tmp/.docker.xauth:ro" \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -w /data/maoli \
+  --net=host \
+  --name=humble \
+  superodom-ros2:latest \
+  /bin/bash
+```
+
+- 权限：`--user 1000:1000`、`HOME=/home/maoli`
+- 挂载：宿主机和容器都使用 `/data/maoli`
+- 可视化：传入 `DISPLAY`、`XAUTHORITY`，并挂载 X11 socket
+- GPU：`--gpus all` 让容器能够看到宿主机全部 GPU
+
+运行具体任务时再选择 GPU：
+
+```bash
+# 使用物理 GPU 0
+CUDA_VISIBLE_DEVICES=0 python train.py
+
+# 使用物理 GPU 1
+CUDA_VISIBLE_DEVICES=1 python train.py
+
+# 使用物理 GPU 0 和 1
+CUDA_VISIBLE_DEVICES=0,1 python train.py
+```
+
+`CUDA_VISIBLE_DEVICES` 只限制当前进程及其子进程，不改变容器配置。指定物理 GPU 1 后，该进程通常会将它重新编号为逻辑 `cuda:0`。
+
+### docker exec
+
+进入现有 `humble` 容器：
+
+```bash
+docker exec -it \
+  -u 1000:1000 \
+  -e HOME=/home/maoli \
+  -w /data/maoli \
+  humble /bin/bash
+```
+
+`docker exec` 只需指定用户、`HOME` 和工作目录；目录、GPU 和 X11 应在创建容器的 `docker run` 阶段配置。
+
+> **来源** · 2026-09-30 · Docker run 与 exec 常用参数 · chat: `aa6a397c-f896-4a27-801a-4c15483949d4` · workspace: `SuperOdom`
