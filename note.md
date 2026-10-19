@@ -39,6 +39,7 @@
   - [maplab console](#maplab-console)
   - [slam_node vertex 时间轴](#slam_node-vertex-时间轴)
   - [PoseLookupBuffer 与 IMU 前向积分](#poselookupbuffer-与-imu-前向积分)
+  - [ROVIO 三组隐式位姿状态](#rovio-三组隐式位姿状态)
   - [建图同步与 LiDAR 时间对齐](#建图同步与-lidar-时间对齐)
   - [ROVIO LiDAR Jacobian、信息矩阵与虚拟量测](#rovio-lidar-jacobian信息矩阵与虚拟量测)
   - [unitree project](#unitree-project)
@@ -630,6 +631,108 @@ rosbag play /data/maoli/git/fast_livo_ws/data/HKU_Cultural_Center_01.bag
   以及 **DL localization summary map**（observer、像素、无 landmark 反向表）。
 - 暂不整理回环检测、landmark 合并、以及 summary 的 Binary 通道。
 
+#### KFH 默认参数与 dense recipe
+
+`kfh` 沿 mission 顺序遍历 vertex；满足任一条件就把当前 vertex 选为
+keyframe：达到最大帧间隔、与上一 keyframe 的共视 landmark 太少、有绝对
+6DoF 量测、有 loop-closure edge，或相对位移/旋转达到阈值。首尾 vertex
+会保留；其余非 keyframe vertex 的视觉信息被删除，IMU edge 则拼接。
+
+参数方向：
+
+- `kf_distance_threshold_m`：相对上一 keyframe 的位移达到阈值就保留。
+  **越小越容易触发，保留越密**。
+- `kf_rotation_threshold_deg`：相对旋转达到阈值就保留。
+  **越小越容易触发，保留越密**。
+- `kf_every_nth_vertex`：未触发其他条件时允许连续跳过的数量上限。
+  **越小越早强制保留，保留越密**。
+- `kf_min_shared_landmarks_obs`：计算**当前 vertex 与上一个已选 keyframe**
+  共同观测到的 landmark 数；不是与时间上的上一帧比较。判定条件为
+  `common_observations < threshold`，成立时保留当前 vertex：
+  - 默认值 20：共视数 `0–19` 时保留，`>=20` 时不由此条件保留。
+  - dense 值 15：共视数 `0–14` 时保留，`>=15` 时不由此条件保留。
+  - 共视数为 0 时仍会保留。设计意图是把“与上一 keyframe 重叠很少”的
+    新视角或新区域作为 keyframe，维持地图覆盖与 track 连续性；该指标不是
+    图像质量或弱帧过滤器。
+  - 如果共视为 0 的原因是跟踪失败、遮挡或当前帧本身没有有效 landmark，
+    现有启发式同样会保留这个弱帧。要过滤这种情况，需要另加“当前帧有效
+    landmark 总数/质量”的门槛，不能只调本参数。
+  - 因为阈值越大，`common < threshold` 越容易成立，所以**越大越容易保留、
+    keyframe 越密**。这一方向与参数名及直觉都容易混淆。
+
+裸跑 `kfh` 的代码默认值：
+
+```text
+distance=0.75 m, rotation=20 deg, every_nth=10, min_shared=20
+```
+
+`cfg/base/mapping/console/kfh_dense.commands`：
+
+```text
+distance=0.2 m, rotation=10 deg, every_nth=5, min_shared=15
+```
+
+对比结论：
+
+- dense 的距离、旋转、帧间隔三个阈值都更容易保留 keyframe，因此整体上
+  **比默认更密、剪枝更弱**。
+- dense 的 `min_shared` 从 20 降到 15，反而更难因“共视不足”保留 keyframe，
+  这一项单独看比默认更稀；它与另外三个参数方向相反。
+- 所以不能笼统说 dense 的每个条件都“更严格”。若“严格”指删除更多 vertex，
+  **默认 `kfh` 整体更严格/更激进**；若指 keyframe 保留更敏感，则 dense
+  整体更敏感。
+- Go2 实测默认 `kfh` 保留 `471/4039 = 11.7%`，删除 88.3%。轨迹平稳且
+  相邻帧共视高时，距离、旋转、共视条件较少触发，结果主要受
+  `kf_every_nth_vertex=10` 控制。
+- `kfh` 会原地修改内存地图；已经删除的 vertex 不能靠再跑 dense 参数恢复。
+  对比两组参数必须从同一份原始 VI-Map 分别重新 `load` 后运行。
+
+> **来源** · 2026-10-14 · KFH 默认与 dense 参数对比 · chat: `fef9e509-9ec4-4d77-bfea-b85b11dd7a46` · workspace: `rob_slam-research`
+
+#### ELQ 标记与 summary landmark 筛选
+
+`elq` 的调用链：
+
+1. `console-plugins/landmark-manipulation-plugin/src/landmark-manipulation-plugin.cc`
+   中，console 命令 `elq` 调用
+   `vi_map_helpers::evaluateLandmarkQuality(mission_ids, map)`。
+2. `algorithms/vi-map-helpers/src/vi-map-landmark-quality-evaluation.cc`
+   遍历 mission 内全部 landmark，并以 `kReEvaluateLandmarkQuality=true`
+   强制重算质量：
+
+```cpp
+landmark.setQuality(
+    vi_map::isLandmarkWellConstrained(
+        *map, landmark, kReEvaluateLandmarkQuality)
+        ? vi_map::Landmark::Quality::kGood
+        : vi_map::Landmark::Quality::kBad);
+```
+
+3. `map-structure/vi-map/src/landmark-quality-metrics.cc` 中，
+   `isLandmarkWellConstrained()` 按特征类型分流：LiDAR landmark 走
+   `isLiDARLandmarkWellConstrained()`，其余视觉 landmark（包括 Binary
+   和 DL）走 `isVisualLandmarkWellConstrained()`。视觉检查包括最少观测数、
+   最近观测距离、最大视差角，以及启用时的重投影误差。
+
+summary 导出的筛选链：
+
+1. `console-plugins/vi-map-summarization-plugin/src/summarization-plugin.cc`
+   的 `saveSummaryMapToDisk()` 调用
+   `createLocalizationSummaryMapForWellConstrainedLandmarks()`。
+2. `map-structure/localization-summary-map/src/localization-summary-map-creation.cc`
+   先调用 `VIMapQueries::getAllWellConstrainedLandmarkIds()`，再把筛选后的
+   landmark ID 列表传给 `createLocalizationSummaryMapFromLandmarkList()`。
+3. `algorithms/vi-map-helpers/src/vi-map-queries.cc` 遍历全部 landmark，只保留
+   `isLandmarkWellConstrained()` 返回 true 的 ID。已有 `Good/Bad` 标记会直接
+   判定；只有 `Unknown` 才现场计算几何质量。
+4. Binary 与 DL 类型的拆分发生在上述统一筛选之后，因此 `elq` 标成 `Bad`
+   的 DL landmark 同样不会写入 summary，也不会进入后续 DL 匹配与 PnP。
+
+结论：`elq` 不是只为 `kfh` 服务；它在 `rtl` 后统一刷新 landmark 的几何质量，
+而 summary 只导出通过该质量门槛的 landmark。
+
+> **来源** · 2026-10-14 · ELQ 与 summary 筛选链路 · chat: `2ac66d53-0a49-4d5a-84a8-af965fcfeae1` · workspace: `rob_slam-research`
+
 ### slam_node vertex 时间轴
 
 VI-Map **vertex 时间基准是图像 NFrame，不是 odometry**。`slam_odom_T_M_I` 只提供轨迹采样，在 `t_image` 上插值得到 vertex pose；每条 odometry **不**创建 vertex。
@@ -691,6 +794,91 @@ DEFINE_int64(
 - **`getRotationBetween`**（特征跟踪帧间旋转）：只用 IMU 陀螺积分，**不走** `max_allowed_propagation_time_ns_` 上限。
 
 > **来源** · 2026-09-22 · PoseLookupBuffer 500 ms 与 RK4 分支 · chat: `eb882abe-dff4-4ed5-93dc-38f3d903199d` · workspace: `rob_slam-research`
+
+### ROVIO 三组隐式位姿状态
+
+ROVIO 当前有三组容易混淆的附加位姿状态。前两组由 `nPose` 控制并复用
+`_pop/_poa` 数组，第三组由 `enableMapLocalization` 独立控制。
+
+#### 1. 惯性系对齐状态 `IrIW/qWI`
+
+- `IrIW`：ROVIO 局部世界系 W 原点在外部全局惯性系 I 中的位置。
+- `qWI`：W 与 I 之间的旋转。
+- 存储在 `state.poseLin(inertialPoseIndex_)` 与
+  `state.poseRot(inertialPoseIndex_)`，对应 `_pop/_poa` 的一个元素。
+- `PoseUpdate` 6DoF 路径使用外部 `T_G_B` 量测更新这组状态。
+- maplab 命名中 ROVIO 的 W 对应 mission 系 M，I 对应 global map 系 G；
+  输出按下式直接构造：
+
+```text
+T_G_M = Transformation(qWI.inverse(), IrIW)
+```
+
+#### 2. 量测 body 外参状态 `MrMV/qVM`
+
+- ROVIO `PoseUpdate` 的 V 是外部位姿量测所描述的 body/sensor frame，M 是
+  ROVIO IMU frame。
+- `MrMV/qVM` 表示 IMU M 与量测 body V 之间的外参。
+- `bodyPoseIndex_ >= 0` 时，它们存储在 `_pop/_poa` 的另一个元素中，进入
+  covariance，并由 `PoseUpdate` 联合估计。
+- `bodyPoseIndex_ == -1` 时，不存在对应状态维；`MrMV/qVM` 只是
+  `PoseUpdate` 内的固定配置参数。相关配置仍存在，但
+  `init_cov_MrMV/init_cov_qVM` 和 `pre_cov_MrMV/pre_cov_qVM` 不会注册到
+  filter state。
+
+`nPose` 与两个索引的当前模板关系：
+
+```text
+nPose = 0:
+  inertialPoseIndex_ = -1
+  bodyPoseIndex_     = -1
+  _pop/_poa 中没有 additional pose
+
+nPose = 1:
+  inertialPoseIndex_ = 0
+  bodyPoseIndex_     = -1
+  状态仅含 IrIW/qWI，共 6 维误差状态
+
+nPose = 2:
+  inertialPoseIndex_ = 0
+  bodyPoseIndex_     = 1
+  状态含 IrIW/qWI 与 MrMV/qVM，共 12 维误差状态
+```
+
+这里真正决定状态维数的是 `nPose`；两个 index 只是说明每个数组槽位的用途。
+
+#### 3. 结构特征定位状态 `WrWG/qWG`
+
+- 由 `enableMapLocalization` 控制，对应独立的 `_pmp/_pma`，不占用
+  `nPose` 的 `_pop/_poa`。
+- `LocalizationLandmarkUpdate` 使用图像 2D keypoint 与地图 3D landmark
+  约束更新该状态。
+- 它保存的是 `T_M_G` 方向，输出时求逆：
+
+```text
+T_M_G = Transformation(qWG, WrWG)
+T_G_M = T_M_G.inverse()
+```
+
+#### 三组状态的关系
+
+`IrIW/qWI` 与 `WrWG/qWG` 在物理上都描述 global map 与 local mission 的
+对齐关系，但方向、状态槽位和测量模型不同：
+
+```text
+IrIW/qWI → PoseUpdate 6DoF 路径
+          → 直接导出 T_G_M
+
+WrWG/qWG → LocalizationLandmarkUpdate 结构特征路径
+          → 保存 T_M_G，再求逆得到 T_G_M
+```
+
+运行时由 `violoc_use_6dof_localization` 选择其中一条定位路径。当前工厂同时
+设置 `kNPoses=1` 和 `kEnableMapLocalization=true`，因此两类状态在编译后的
+filter state 中都存在；实际导出哪一组取决于运行模式。`MrMV/qVM` 当前因为
+`bodyPoseIndex_=-1` 仅作为固定外参使用。
+
+> **来源** · 2026-10-15 · ROVIO 三组位姿状态 · chat: `f5164701-4633-40e2-9b1d-ea2fd2ed9ba5` · workspace: `rob_slam-research`
 
 ### 建图同步与 LiDAR 时间对齐
 
