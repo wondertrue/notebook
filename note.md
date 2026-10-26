@@ -42,10 +42,14 @@
   - [ROVIO 三组隐式位姿状态](#rovio-三组隐式位姿状态)
   - [建图同步与 LiDAR 时间对齐](#建图同步与-lidar-时间对齐)
   - [ROVIO LiDAR Jacobian、信息矩阵与虚拟量测](#rovio-lidar-jacobian信息矩阵与虚拟量测)
+  - [Map Tracking 虚拟 database 帧](#map-tracking-虚拟-database-帧)
   - [unitree project](#unitree-project)
 - [Docker](#docker)
+  - [用 Docker 修复宿主机目录所有权](#用-docker-修复宿主机目录所有权)
   - [docker run](#docker-run)
   - [docker exec](#docker-exec)
+- [C++语法规则](#c语法规则)
+  - [原子比较交换 compare_exchange_strong](#原子比较交换-compare_exchange_strong)
 
 ---
 
@@ -1062,6 +1066,134 @@ P^+=P^--K P_yK^\mathsf T.
 
 > **来源** · 2026-09-26 · ROVIO LiDAR 信息矩阵与虚拟量测 · chat: `7c120f61-7bc0-40f4-b8c4-d74a774d3ad0` · workspace: `rob_slam-research`
 
+### Map Tracking 虚拟 database 帧
+
+Map Tracking 不执行 Global VPR，也不从 summary map 选一张已有 database
+图像。它使用当前 VIO 位姿，把可能可见的 summary-map 3D landmark 投影到
+当前相机，现场构造一个只含 keypoint、score、descriptor 和 landmark ID 的
+虚拟 `FrameFromSummaryMap`，再与当前 query 图像做点特征匹配和几何验证。
+
+#### 1. 当前位姿与入口
+
+`localizer-flow.cc` 用最近一次 ROVIO 状态构造 IMU 在全局地图系的位姿：
+
+```cpp
+T_ItoG = last_rovio_estimate_.T_G_M *
+         last_rovio_estimate_.vinode.get_T_M_I();
+```
+
+Map Tracking 将其传给 `localizeNFrameMapTracking()`，最终以
+`global_localization=false` 调用 loop detector。对 NFrame 中每个相机：
+
+```cpp
+const aslam::Transformation T_ItoC =
+    n_camera.get_T_C_B(frame_idx);
+const aslam::Transformation T_CtoG =
+    T_ItoG * T_ItoC.inverse();
+
+extractFrameFromSummaryMap(
+    T_CtoG, n_camera.getCamera(frame_idx),
+    /*max_distance=*/3.0, &frames_from_summary_map[0]);
+```
+
+这里 `T_CtoG` 表示当前相机在全局地图系中的位姿；候选地标最大三维距离
+**硬编码为 3.0 m**，当前没有 YAML/gflag 配置。
+
+#### 2. 地标候选筛选
+
+`extractLandMarkIndicesInFoVAndDistance()` 依次执行：
+
+1. 用 1 m 空间网格获取当前相机附近的地图点候选。
+2. 球形距离门控：`‖p_landmark - p_camera‖ <= 3.0 m`。
+3. 相机 FoV 门控：地标必须位于相机前方，并在相机模型给出的
+   left/right/top/bottom border 内。
+4. 地标历史观察方向门控。
+5. 地标历史观察距离门控。
+
+观察方向门控的核心逻辑：
+
+```cpp
+Eigen::Vector3d d = lm_pos - camera_position_in_G;
+Eigen::Vector3d d_xy(d.x(), d.y(), 0.0);
+Eigen::Vector3d d_normalized = d_xy.normalized();
+
+double min_diff_dot = std::max(
+    std::cos(landmark_observer_yaw_range + 30.0 * DEG2RAD), 0.0);
+if (d_normalized.dot(landmark_observer_mean_vec_inG) < min_diff_dot) {
+  continue;
+}
+```
+
+- `d_normalized`：当前相机指向地标的水平单位向量。
+- `landmark_observer_mean_vec_inG`：建图时该地标历史观察方向的平均单位向量。
+- 允许偏角：
+  `current_angle <= min(landmark_observer_yaw_range + 30°, 90°)`。
+- `+30°` 是运行时放宽量；`max(cos(...), 0)` 将最大允许偏角限制为 90°，
+  防止从地标相反一侧取点。
+
+观察距离门控：
+
+```cpp
+double dist_diff =
+    std::abs(d.norm() - landmark_observer_mean_dist);
+if (dist_diff > landmark_observer_dist_range + 2.0) {
+  continue;
+}
+```
+
+即当前观察距离必须落在历史距离范围额外放宽 **2.0 m** 后的区间内。
+`mean_yaw/yaw_range/mean_dist/dist_range` 是建 summary map 时按每个地标的
+历史观测统计并存入地图的数据，不是 localization YAML 参数。LiDAR 补充地标
+创建时的初值为 `yaw_range=45°`、`dist_range=2.0 m`。
+
+#### 3. 投影并构造虚拟帧
+
+通过筛选的 3D landmark 使用当前 `T_CtoG` 和真实相机模型投影：
+
+```cpp
+const Eigen::Vector3d lm_pos_C =
+    T_CtoG.inverse().transform(lm_pos_G);
+const aslam::ProjectionResult result =
+    camera.project3(lm_pos_C, &keypoint);
+if (!result.isKeypointVisible()) {
+  continue;
+}
+```
+
+投影后还会：
+
+- 以 **8×8 pixel** 为遮挡网格，每格只保留深度最近的 landmark。
+- 候选超过 **800** 时，按地图中的 point score 取最高 800 个。
+- 将投影像素写入 `keypoints`，从 summary map 复制对应 `scores`、
+  `descriptors` 和 `landmark_ids`。
+- 虚拟帧没有真实 database 图像；`observer_image` 只用于调试显示。
+
+随后 query 图像特征与虚拟帧 descriptor 做 SP/SG（或 LightGlue）匹配，
+再由 `computeAbsoluteTransformFromFrameMatches()` 做几何验证。Map Tracking
+失败可能发生在候选为空、点匹配不足或几何验证失败中的任一阶段。
+
+#### 4. 与 Global NMS 的区别
+
+`lc_dl_image_descriptor_match_combined_nms_radius=5` 只作用于 Global VPR 的
+observer 帧候选去重，不参与上述虚拟帧生成。其组合距离为：
+
+```text
+combined_distance =
+    translation_distance_m + angle_distance_deg / 45 * 3
+```
+
+组合距离小于 5 的低分候选会被 NMS 丢弃；Map Tracking 不运行 image
+descriptor brutal-force，因此也不使用该阈值。
+
+**关键路径**
+
+- `applications/rovioli/src/localizer-flow.cc`
+- `applications/rovioli/src/localizer.cc`
+- `algorithms/loopclosure/deep-learning-loop-detector/src/deep_learning_loop_detector.cpp`
+- `map-structure/localization-summary-map/src/localization-summary-map-creation.cc`
+
+> **来源** · 2026-10-26 · Map Tracking 虚拟帧 · chat: `未找到` · workspace: `rob_slam-research`
+
 ### unitree project
 
 **工程上下文**：`maplab_ws` + `dog-violoc.launch`，标定 `d435i.yaml`，IMU topic `/camera/imu`，相机 `/camera/infra1/image_rect_raw`。
@@ -1110,6 +1242,97 @@ P^+=P^--K P_yK^\mathsf T.
 ## Docker
 
 > 常用的权限、目录挂载、RViz 显示和 GPU 选择参数。
+
+### 用 Docker 修复宿主机目录所有权
+
+适用场景：当前账号没有 `sudo`，但属于 `docker` 组；个人目录被错误 UID
+拥有，导致 Cursor Server 或普通文件无法写入。Docker 容器默认以 root
+运行，通过 bind mount 修改的是宿主机文件；`--rm` 只在命令结束后删除临时
+容器，不会撤销文件修改。
+
+先确认当前账号的数字 UID/GID，并查看目录中的所有者分布：
+
+```bash
+uid=$(id -u)
+gid=$(id -g)
+printf 'uid=%s gid=%s\n' "$uid" "$gid"
+
+ls -ldn /nfs/home/maoli /PnP/maoli
+find /PnP/maoli -xdev -printf '%U:%G\n' | sort | uniq -c
+```
+
+#### `/nfs/home/maoli`：整个个人 home 批量改回当前账号
+
+仅在确认整个目录都是自己的数据后执行：
+
+```bash
+uid=$(id -u)
+gid=$(id -g)
+
+docker run --rm \
+  -v /nfs/home/maoli:/target \
+  alpine:3.20 \
+  chown -R "$uid:$gid" /target
+```
+
+验证：
+
+```bash
+ls -ldn /nfs/home/maoli
+find /nfs/home/maoli -xdev ! -uid "$(id -u)" -print -quit
+```
+
+如果只需修复 Cursor，缩小挂载范围：
+
+```bash
+uid=$(id -u)
+gid=$(id -g)
+
+docker run --rm \
+  -v /nfs/home/maoli/.cursor-server:/target \
+  alpine:3.20 \
+  chown -R "$uid:$gid" /target
+```
+
+#### `/PnP/maoli`：只替换旧 owner，保留 `root` 文件
+
+先从前面的所有者分布中确定错误 owner 的数字 UID。每次 owner 可能不同，
+所以不要永久写死旧 UID。以下以旧 UID `7710` 为例：
+
+```bash
+uid=$(id -u)
+gid=$(id -g)
+old_uid=7710
+
+# 只读预览
+docker run --rm \
+  -v /PnP/maoli:/target:ro \
+  alpine:3.20 \
+  find /target -xdev -user "$old_uid" -print
+
+# 确认后批量修改；-h 避免跟随符号链接修改链接目标
+docker run --rm \
+  -v /PnP/maoli:/target \
+  alpine:3.20 \
+  find /target -xdev -user "$old_uid" \
+  -exec chown -h "$uid:$gid" {} +
+```
+
+验证旧 UID 已清空：
+
+```bash
+find /PnP/maoli -xdev -uid "$old_uid" -print
+```
+
+注意：
+
+- `/PnP/maoli` 中原属 `root:root` 的文件不会被上述定向命令修改。
+- 如果看到 `Operation not permitted`，通常是 NFS 启用了 `root_squash`；
+  `--privileged` 也无法绕过 NFS 服务端权限，需要管理员在存储端修复。
+- 如果目录出现他人的私钥或明显的个人数据，不要直接接管，先确认目录是否
+  分配错误。
+
+> **来源** · 2026-10-23 · Docker 批量修复目录所有权 · chat: `67b43b08-476d-4baf-b811-a97c142059a3` · workspace: `notebook`
 
 ### docker run
 
@@ -1170,3 +1393,33 @@ docker exec -it \
 `docker exec` 只需指定用户、`HOME` 和工作目录；目录、GPU 和 X11 应在创建容器的 `docker run` 阶段配置。
 
 > **来源** · 2026-09-30 · Docker run 与 exec 常用参数 · chat: `aa6a397c-f896-4a27-801a-4c15483949d4` · workspace: `SuperOdom`
+
+---
+
+## C++语法规则
+
+> 记录容易误读的 C++ 语法、标准库接口及其使用语义。
+
+### 原子比较交换 compare_exchange_strong
+
+```cpp
+bool expected = false;
+if (flag.compare_exchange_strong(expected, true)) {
+  // Only this caller changes flag from false to true.
+}
+```
+
+- 可按 **compare + exchange** 记忆：先把原子变量当前值与 `expected` 比较，
+  相等时才写入第二个参数 `true`。这种操作通常称为 CAS
+  （Compare-And-Swap）。
+- 第一个参数 `expected` 是输入/输出参数：
+  - 当前值为 `false`：比较成功，将原子变量写成 `true`，返回 `true`；
+    `expected` 保持 `false`。
+  - 当前值为 `true`：比较失败，不写入原子变量，返回 `false`；
+    同时将实际当前值写回 `expected`，所以它变成 `true`。
+- `strong` 表示不会出现 `weak` 版本允许的“伪失败”：值明明相等却返回失败。
+  因此 `strong` 常用于只尝试一次的 `if`；`weak` 常放在重试循环中。
+- 它相当于线程安全地把“检查是否为 `false`”和“设置为 `true`”合并成一个
+  不可分割的操作，可用于保证多个调用者中只有一个取得执行权。
+
+> **来源** · 2026-10-21 · C++ 原子比较交换语义 · chat: `未找到` · workspace: `rob_slam-research`
