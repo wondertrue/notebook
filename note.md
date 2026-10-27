@@ -46,6 +46,8 @@
   - [ROVIO LiDAR Jacobian、信息矩阵与虚拟量测](#rovio-lidar-jacobian信息矩阵与虚拟量测)
   - [Map Tracking 虚拟 database 帧](#map-tracking-虚拟-database-帧)
   - [unitree project](#unitree-project)
+- [ROS2](#ros2)
+  - [软件层次](#软件层次)
 - [Docker](#docker)
   - [用 Docker 修复宿主机目录所有权](#用-docker-修复宿主机目录所有权)
   - [docker run](#docker-run)
@@ -1309,6 +1311,49 @@ descriptor brutal-force，因此也不使用该阈值。
 | RDF→FLU 输出外参 | `target_point_extrinsics` / `common/vio-common/target-point-config.h` |
 
 > **来源** · 2026-09-02 · maplab violoc IMU 系与重力对齐 · chat: `c272ab80-b4aa-4cfc-9cac-2a5e6b771b4b` · workspace: `slam-research`
+
+---
+
+## ROS2
+
+> ROS2 客户端 API、中间件抽象与底层通信实现。
+
+### 软件层次
+
+ROS2 从应用到网络传输依次分为：
+
+1. **用户程序**：业务节点及算法代码。
+2. **`rclcpp` / `rclpy`**：C++ / Python 客户端库，提供 `Node`、
+   `Publisher`、`Subscription`、Timer 等语言层 API。
+3. **`rcl`**：ROS Client Library 的 C 核心层，供不同语言客户端复用；
+   它不是通信协议。
+4. **`rmw`**：ROS Middleware 抽象接口，将 ROS2 的发布、订阅等操作适配到
+   具体中间件。
+5. **CycloneDDS / Fast DDS**：具体 DDS 实现，负责发现、序列化与网络传输。
+
+典型发布调用链为：
+
+```text
+用户程序
+    ↓
+rclcpp（C++）/ rclpy（Python）
+create_publisher() / publish()
+    ↓
+rcl
+    ↓
+rmw
+    ↓
+CycloneDDS / Fast DDS
+DDS DataWriter
+    ↓
+网络
+```
+
+原生 DDS 程序可以绕过 `rclcpp`、`rcl` 和 `rmw`，直接使用 DDS API。
+因此“使用 DDS”不等于“发布端是 ROS2 节点”；ROS2 是建立在中间件之上的
+完整客户端与运行时体系。
+
+> **来源** · 2026-10-27 · ROS2 软件层次 · chat: `未找到` · workspace: `rob_infrastructure`
 
 ---
 
