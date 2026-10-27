@@ -20,10 +20,12 @@
   - [匹配与几何验证](#匹配与几何验证)
   - [笔记](#笔记-2)
 - [VLN](#vln)
-  - [任务与设定](#任务与设定)
-  - [方法](#方法)
-  - [仿真器与可视化工具](#仿真器与可视化工具)
-  - [Pipeline 文档](#pipeline-文档)
+  - [VLN-CE + ABot-N1](#vln-ce--abot-n1)
+    - [任务与设定](#任务与设定)
+    - [方法](#方法)
+    - [仿真器与可视化工具](#仿真器与可视化工具)
+    - [Pipeline 文档](#pipeline-文档)
+  - [LightNav-0](#lightnav-0)
   - [笔记](#笔记-3)
 - [3D-GS](#3d-gs)
   - [表示与渲染](#表示与渲染)
@@ -280,19 +282,21 @@ Vision-Language Navigation。
 
 > 待补充：任务定义、数据集、代表性方法、评测指标。
 
-### 任务与设定
+### VLN-CE + ABot-N1
+
+#### 任务与设定
 
 - **VLN-CE**（Vision-and-Language Navigation in Continuous Environments）：给机器人一句自然语言指令，只靠第一人称 RGB + 深度图 + 指令，在连续三维室内环境中一步一步导航到目标点。
 - 数据集：R2R-VLNCE（Matterport3D 扫描房屋 + 人工标注指令）。
 - 动作空间：前进 0.25m / 左转 15° / 右转 15° / 停止，共 4 个离散动作。
 - 评测指标：SR（成功率）、SPL（路径效率加权成功率）、NE（终点到目标距离）、NDTW（轨迹贴合度）。
 
-### 方法
+#### 方法
 
 - **CMA**（Cross-Modal Attention）：VLN-CE baseline 策略网络，由指令 LSTM 编码器 + 冻结 ResNet 视觉/深度编码器 + 跨模态注意力 + GRU 状态编码器 + 动作头构成。训练方式为 DAgger + Teacher Forcing 模仿学习。无 LLM、无 CoT、无 RL。
 - **ABot-N1**：快慢双系统通用导航基座。慢系统为 VLM，做 CoT 推理，输出"像素目标"；快系统为轻量控制器，负责执行。五类导航任务统一为像素目标接口，产生跨任务正迁移。训练含大规模模仿预训练 + GRPO 强化学习后训练（下游导航奖励对齐）。
 
-### 仿真器与可视化工具
+#### 仿真器与可视化工具
 
 - **Habitat-Sim**：VLN-CE 使用的三维仿真器（Facebook AI 开源），场景来自 Matterport3D 真实建筑扫描。
   - 场景文件：`.glb`（三维几何纹理）、`.navmesh`（可行走区域多边形网格）、`.house`（房间元数据）。
@@ -323,7 +327,7 @@ for area in bpy.context.screen.areas:
                 space.clip_end = 10000
 ```
 
-### Pipeline 文档
+#### Pipeline 文档
 
 - VLN-CE + ABot-N1 完整 pipeline 文档（含流程图、模型架构、训练、代码指向、ABot-N1 替换对照表）已保存至：
   `notebook/assets/VLNCE and Abot-N1 pipeline.md`
@@ -341,6 +345,75 @@ for area in bpy.context.screen.areas:
   11. 现有模型清单 + ABot-N1 替换对照表（含术语速查：CoT、GRPO、像素目标、正迁移）
 
 > **来源** · 2026-08-30 · VLN-CE 架构与 ABot-N1 技术对比 · chat: `f6ca8d63-d899-4184-ab78-c4b4121c2828` · workspace: `VLN-CE`
+
+### LightNav-0
+
+#### LightNav-0 输出是什么
+/data/maoli/git/LightNav-0
+LightNav-0 不直接输出电机或速度指令。模型先输出离散轨迹 token（如 `<traj_57>` 或一组 RVQ action token），再通过轨迹词表解码成一段局部 waypoint 轨迹：
+
+```text
+H × [forward_m, lateral_m, yaw_rad]
+```
+
+- `forward_m`：机器人前向相对位置；
+- `lateral_m`：机器人横向相对位置，正值向左；
+- `yaw_rad`：相对航向角，正值逆时针；
+- 每一行都是相对于当前图像对应机器人位姿的**累计目标位姿**，不是相邻 waypoint 间的增量；
+- 全零轨迹表示 `STOP`；
+- waypoint 只有空间几何含义，没有自带时间基准，因此本身不是速度。
+
+#### MPC 的全称与作用
+
+**MPC = Model Predictive Control，模型预测控制。** 它根据机器人运动模型，在有限预测时域内寻找一组未来控制量，使预测轨迹尽量接近参考 waypoint，同时满足速度和加速度约束。
+
+在 LightNav-0 实机链路中，MPC 是连接“VLN 输出的局部轨迹”和“Go2 可执行速度”的规控模块：
+
+- 输入：LightNav waypoint、Go2 当前里程计位姿、上一时刻控制量；
+- 约束：最大线速度、角速度、线加速度和角加速度；
+- 输出：当前应执行的线速度 `v` 和角速度 `ω`；
+- 当前实现以 `10 Hz` 运行，`dt=0.1 s`，每次预测未来 `5` 步；
+- 每次只执行优化结果的第一步，下一周期根据最新里程计重新求解，这种方式称为**滚动时域控制**；
+- 当前采用 unicycle 模型，不直接输出横向速度，而是通过前进和转向逐步跟踪带横向偏移的 waypoint。
+
+相比直接计算 `v=forward/dt`、`ω=yaw/dt`，MPC 还会考虑实际轨迹偏差、速度平滑性和机器人运动约束，因此更适合实机闭环控制。
+
+#### LightNav-0 → Go2 完整流程
+
+```text
+自然语言指令 + Go2 前向 RGB 图像
+    → LightNav-0 GPU 模型服务
+    → 轨迹 token 解码
+    → 局部 waypoint 轨迹 [forward, lateral, yaw]
+    → 按图像采集时间戳匹配 Go2 odom
+    → waypoint 从 base_link 转换到 odom 坐标系
+    → MPC 以 10 Hz 闭环求解 [v, ω]
+    → ROS 2 话题 mpc/cmd_vel（TwistStamped）
+    → go2_adapter 做控制源仲裁、超时保护
+    → Unitree ObstaclesAvoidClient.Move(v, 0, ω)
+    → Go2 执行并返回新 odom 与相机图像
+    → 下一轮重新感知、规划和控制
+```
+
+注意：自然语言指令不是直接发给 Go2。它与相机图像一起发送给 LightNav-0；Go2 最终接收的是经过 MPC 计算的速度指令。
+
+仓库模块分工：
+
+- `lightnav-serve`：在 GPU 主机运行模型推理；
+- `vln_client`：发送图像和指令，接收 waypoint；
+- `vln_mpc`：时间对齐、坐标转换和 MPC 轨迹跟踪，发布 `mpc/cmd_vel`；
+- `go2_adapter`：接收 `TwistStamped`，通过 Unitree SDK 向 Go2 下发速度，并提供 watchdog、停止和遥控器接管；
+- Go2 的实际里程计反馈重新进入 MPC，从而形成低层运动控制闭环。
+
+#### 与 VLN-CE 输出的差异
+
+- 本文运行的 **VLN-CE CMA** 每一步直接输出四选一离散动作：`STOP`、前进 `0.25 m`、左转 `15°`、右转 `15°`。
+- **LightNav-0** 输出的是未来一段局部 waypoint 轨迹，包含相对前向位置、横向位置和航向角，表达能力更连续，并带有短时前瞻。
+- VLN-CE CMA 的动作由 Habitat-Sim 按理想运动学直接执行，不需要转换成实机速度。
+- LightNav-0 waypoint 不是速度；接入 Go2 时必须经过时间对齐、坐标转换和 MPC，才能得到 `v、ω`。
+- VLN-CE 项目另有 waypoint 扩展，能够输出局部距离和角度，但它不等同于本文 demo 使用的 CMA 四动作策略，动作定义也不等同于 LightNav-0 的 `H×3` 轨迹块。
+
+> **来源** · 2026-10-27 · LightNav-0 接入 Go2 · chat: `未找到` · workspace: `notebook`
 
 ### 笔记
 
