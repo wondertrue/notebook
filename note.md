@@ -48,6 +48,9 @@
   - [unitree project](#unitree-project)
 - [ROS2](#ros2)
   - [软件层次](#软件层次)
+  - [ROS-free 算法边界](#ros-free-算法边界)
+  - [tnros_comm 与 CycloneDDS](#tnros_comm-与-cyclonedds)
+  - [部署选择](#部署选择)
 - [Docker](#docker)
   - [用 Docker 修复宿主机目录所有权](#用-docker-修复宿主机目录所有权)
   - [docker run](#docker-run)
@@ -1354,6 +1357,131 @@ DDS DataWriter
 完整客户端与运行时体系。
 
 > **来源** · 2026-10-27 · ROS2 软件层次 · chat: `未找到` · workspace: `rob_infrastructure`
+
+### ROS-free 算法边界
+
+`rob_slam-research` 的“ROS-free”主要指**算法与 Pipeline 核心接口不依赖 ROS**，
+不是整个产品进程完全没有 ROS2 技术栈：
+
+- 算法、地图结构和同步 Pipeline 使用 Eigen、内部 Measurement、
+  `resources::PointCloud` 等内部类型。
+- ROS2 消息、时间戳转换、QoS 和 publish/subscribe 留在 I/O adapter。
+- `rob_slam_loc` 产品入口仍使用 `sensor_msgs::msg::*`、自定义 ROS2 消息和
+  rosidl type support，只是没有把 `rclcpp` 类型暴露给算法库。
+- 历史提交 `f207b27c` 删除了 ROS1 `ros-helpers`、`slam_ros_common`、
+  `minkindr_conversions` 等约 3300 行代码；Plan 21 的目标是算法边界去 ROS1、
+  产品 I/O 改走 tnros/DDS。
+
+这样分层的主要收益：
+
+- 避免 `sensor_msgs`、`ros::Time`、TF 等 wire 类型污染算法 API。
+- 降低 ROS distro、ABI 和 ROS1/ROS2 同名消息头冲突对核心库的影响。
+- 同一算法可以接 live DDS、rosbag2、raw sensor replay 或其他数据源。
+- DDS discovery、QoS、executor 和反序列化故障被限制在边界 adapter。
+- 产品可以选择依赖系统 ROS2，也可以携带最小通信 runtime 独立交付。
+
+### tnros_comm 与 CycloneDDS
+
+`tnros_comm` 不是另一种 DDS，也没有重新实现 CycloneDDS。它是外部
+**TnrosComm SDK** 提供的薄 ROS2 client wrapper：
+
+```text
+rob_slam_loc
+  → tnros_comm（Node / Publisher / Subscription / QoS）
+  → rcl
+  → rmw_cyclonedds_cpp
+  → CycloneDDS
+  → DDS wire
+```
+
+原生 ROS2 C++ 节点的对应路径是：
+
+```text
+应用 → rclcpp → rcl → rmw_cyclonedds_cpp → CycloneDDS → DDS wire
+```
+
+两条路径共享相同的 ROS2 DDS wire protocol。topic 名、消息定义/type support、
+QoS、`ROS_DOMAIN_ID`、网卡和 discovery 配置一致时，可以直接互通，不需要
+bridge。ROS2 也不保证默认使用 CycloneDDS；系统可能默认 Fast DDS，需要安装
+并选择 `rmw_cyclonedds_cpp`。
+
+本仓库通过 Ivy 获取 SDK：
+
+```text
+ops/ci/infra_deps/build.py
+  StaticLibraryDependency(componentName='TnrosComm',
+                          baseRevision='0.2.0-alpha')
+```
+
+平台产物位于：
+
+```text
+ops/ci/infra_deps/modules/<platform>/
+├── include/tnros_comm/tnros_comm.hpp
+├── lib/release/libtnros_comm.so
+└── lib/release/librmw_cyclonedds_cpp.so
+```
+
+当前二进制验证结果：
+
+- `libtnros_comm.so` 自身定义 `rcl_init`、`rcl_node_init`、`rcl_publish`、
+  `rcl_take`、`rcl_wait`、`rcl_shutdown` 等符号，说明 `rcl` 被静态包含。
+- 它不动态依赖单独的 `librcl.so`，但动态依赖
+  `librmw_cyclonedds_cpp.so`。
+- `tnros_comm.hpp` 用 opaque implementation 隐藏 `rcl/rclcpp` 类型，
+  公开一个较小且稳定的 API。
+
+因此“`rcl` 封装在 SDK 内”更准确地说是：
+**`rcl` 静态打包在 TnrosComm SDK 的 `libtnros_comm.so` 中，Cyclone RMW
+作为随 SDK 分发的动态库加载。**
+
+### 部署选择
+
+#### 仓库脚本的实际行为
+
+- `run_localization.sh` 启动 `rob_slam_loc`，由 `tnros_comm` 订阅 DDS；
+  `ros2 bag play/record` 使用系统 ROS2 子 shell。两边共享
+  `CYCLONEDDS_URI` 和 `RMW_IMPLEMENTATION`。
+- 该脚本会生成 loopback DDS 配置，适合本机 bag/raw sensor 回放，不适合
+  Go2 真机跨网卡订阅。
+- Go2 live 使用 `start_live_localization.sh`：设置 `ROS_DOMAIN_ID=1` 和
+  `cyclonedds_go2.xml`，直接订阅板端相机、IMU、轮速和 LiDAR ROS2 topic。
+
+#### 已有 ROS2 环境时
+
+同时保留系统 ROS2 和 TnrosComm SDK 会增加：
+
+- 重复的 RMW/DDS 动态库和磁盘占用；
+- 系统库与 SDK 库的版本漂移风险；
+- `LD_LIBRARY_PATH`、RMW plugin 和 rosidl type support 冲突的排障成本。
+
+它不会产生一条额外的消息桥接链路；`rob_slam_loc` 和原生 ROS2 节点在 DDS
+上直接通信，不会因为 tnros wrapper 导致网络流量翻倍。仓库把
+`ros2 bag` 放进干净 ROS2 子 shell，正是为了防止 SDK 内
+`librmw_cyclonedds_cpp.so` 覆盖 `/opt/ros` 的版本。
+
+#### 没有 ROS2 环境时
+
+定位产品包可以携带 `libtnros_comm.so`、`librmw_cyclonedds_cpp.so`、
+消息/type-support 库及其他依赖，因此 `rob_slam_loc` 本身不要求安装完整
+`/opt/ros/<distro>`，也不需要再安装独立 `rcl`。
+
+但 `ros2 topic`、`ros2 bag`、RViz2 等工具仍需要 ROS2 CLI 环境；读取自定义
+消息还需要对应的 rosidl overlay。其他进程可以不使用 `rcl`，但若直接调用
+CycloneDDS API，就必须自行兼容 ROS2 topic/type naming、序列化和 QoS，
+通常使用 ROS2/RMW 更可靠。
+
+#### 是否还需要 tnros_comm
+
+- 如果目标硬件固定已有且可控的 ROS2、允许依赖 `/opt/ros`，直接使用
+  `rclcpp + 系统 rmw_cyclonedds_cpp` 已足够，额外维护 tnros wrapper 的收益有限。
+- 如果产品要求无系统 ROS2 也能运行、跨 Foxy/Eloquent/板卡统一交付，或需要
+  隐藏 `rclcpp` ABI 和庞大依赖树，TnrosComm 的自包含 SDK 仍有价值。
+- 无论选择哪种 I/O adapter，核心算法都应继续保持 ROS-free。
+- 不需要再开发一套新的 CycloneDDS 壳；真正的架构选择是
+  “依赖系统 ROS2”或“自带最小 ROS2 runtime”。
+
+> **来源** · 2026-10-27 · ROS-free 与 tnros 通信边界 · chat: `未找到` · workspace: `rob_slam-research`
 
 ---
 
