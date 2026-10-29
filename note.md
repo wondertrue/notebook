@@ -34,6 +34,7 @@
 - [建图和定位](#建图和定位)
   - [GOReloc](#goreloc)
   - [FAST-LIO](#fast-lio)
+  - [SuperOdom](#superodom)
   - [FAST-LIVO2](#fast-livo2)
   - [perception_oru NDT（D2D vs P2D）](#perception-oru-ndtd2d-vs-p2d)
   - [Cartographer](#cartographer)
@@ -514,6 +515,71 @@ H × [forward_m, lateral_m, yaw_rad]
 - `normal_*`、`curvature` 在 FAST-LIO 存盘路径中多为 0，勿当几何法向使用
 
 > **来源** · 2026-09-15 · FAST-LIO pipeline 文档索引与 PCD 着色 · chat: `a7612123-be1e-4918-af7d-88cffee70d53` · workspace: `fast_livo_ws`
+
+### SuperOdom
+
+**工作空间**：`/data/maoli/git/research/superodom_ros2_ws`
+
+**主文档**：
+
+- [SuperOdom Humble 运行与算法 Pipeline](/data/maoli/git/research/superodom_ros2_ws/src/SuperOdom/pipeline.md)
+  包含容器环境、编译、bag remap、双路日志、算法数据流、结果对比和排查命令。
+
+**两级优化结构**：
+
+```text
+LiDAR scan
+  → 去畸变到 scan start
+  → 局部地图 5 近邻和平面拟合
+  → Ceres point-to-plane scan-to-map
+  → T_world_lidar（/laser_odometry、/laser_odom_path）
+  → 外参转换到 IMU 中心
+  → GTSAM iSAM2（LiDAR pose prior + IMU 预积分 + bias 随机游走）
+  → pose、velocity、IMU bias 后验
+```
+
+- Ceres 是逐帧局部配准：预测位姿只作为初值；优化变量为
+  `[tx, ty, tz, qx, qy, qz, qw]`。每轮重新搜索局部地图对应并最小化点面残差。
+- `/laser_odom_path` 直接累积 Ceres 输出的 LiDAR 中心位姿。时间戳为
+  `lidar_start_time`，点云也去畸变到 scan start。
+- GTSAM 不接收原始点面残差，而是把 Ceres 输出经外参转换后的 IMU 中心位姿
+  作为 `PriorFactor<X(k)>`，再与 `ImuFactor` 和 bias `BetweenFactor` 联合优化。
+- `propState_` 是 IMU 预积分预测及 GTSAM 初值；优化后的 `prevState_` 是当前
+  LiDAR 时刻的后验。高频 `/state_estimation` 才是从最近后验按 IMU 时间戳传播。
+
+**当前特征实现的重要限制**：
+
+- `extractFeatures()` 创建 `edgePoints` 后只执行 `reserve()`，没有填点；
+  `uniformFeatureExtraction()` 仅输出到 `plannerPoints`。
+- Livox、Velodyne、Ouster 的标准 launch 共用同一个 `feature_extraction_node`
+  和 `extractFeatures()`，所以下游 `processEdgeFeatures()` 因空点云直接返回。
+- 仓库虽然保留 point-to-line 代码，当前标准数据流实际只使用 point-to-plane。
+
+**点面对应与门控**：
+
+1. 用预测 `T_world_lidar` 把当前点投到局部地图。
+2. 搜索 5 个最近地图点并拟合平面 \(n^Tx+d=0\)。
+3. 任一近邻到平面的距离超过 `mapping_plane_resolution / 2` 就拒绝对应；
+   默认 `0.1 m / 2 = 0.05 m`。
+4. 通过门控的当前点贡献 \(r=n^T(Rp+t)+d\) 残差，Ceres 联合优化位姿。
+
+`rob_slam-research` 的 FAST-LIO 类似实现调用链为
+`LidarFrontendUpdateContext::linearize()` → `buildCorrespondences()` →
+`FitPlaneAndGate()`。默认同样使用 5 个近邻，并依次检查近邻数量、最远近邻距离、
+每个近邻的点面距离（默认 `≤0.1 m`）以及当前 scan 点的 range-normalized score。
+
+**双路日志验证**（`recording_20261014_170052`）：
+
+- `superodom_laser_pos_log.txt`：直接记录 `/laser_odometry`，LiDAR 中心。
+- `superodom_pos_log.txt`：记录 GTSAM LiDAR-IMU 后验，IMU 中心。
+- 两者有 5111 个同时间戳样本。补偿外参后，GTSAM 相对 LiDAR 轨迹的位置差：
+  均值 `0.130 m`、95 分位 `0.422 m`、最大 `1.974 m`；旋转差均值 `3.35°`、
+  最大 `28.32°`。
+- 累计路径长度：GTSAM `147.19 m`，LiDAR `68.60 m`。异常段出现 iSAM2
+  underconstrained、large bias 和 reset；该数据集做 pseudo ground truth 时
+  优先使用 LiDAR 日志，但无回环的局部里程计仍不等于严格真值。
+
+> **来源** · 2026-10-29 · SuperOdom 双级优化与点面匹配 · chat: `20cf7a34-6871-4f07-91e2-302e80a33563` · workspace: `superodom_ros2_ws`
 
 ### FAST-LIVO2
 
@@ -1387,11 +1453,26 @@ DDS DataWriter
 
 ```text
 rob_slam_loc
-  → tnros_comm（Node / Publisher / Subscription / QoS）
-  → rcl
-  → rmw_cyclonedds_cpp
-  → CycloneDDS
-  → DDS wire
+  │ include / 调用公开 API
+  ▼
+tnros_comm.hpp
+  │ Node / Publisher / Subscription / QoS
+  │ opaque implementation：不向调用方暴露 rcl / rclcpp 类型
+  ▼
+libtnros_comm.so                         （TnrosComm SDK）
+  │
+  ├── 静态包含 rcl
+  │     rcl_init / rcl_node_init / rcl_publish
+  │     rcl_take / rcl_wait / rcl_shutdown / ...
+  │     因此不需要单独动态加载 librcl.so
+  │
+  └── ELF 动态依赖（DT_NEEDED）
+        ▼
+      librmw_cyclonedds_cpp.so           （随 SDK 分发的动态库）
+        ▼
+      CycloneDDS
+        ▼
+      DDS wire
 ```
 
 原生 ROS2 C++ 节点的对应路径是：
