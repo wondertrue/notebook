@@ -38,6 +38,9 @@
   - [FAST-LIVO2](#fast-livo2)
   - [perception_oru NDT（D2D vs P2D）](#perception-oru-ndtd2d-vs-p2d)
   - [Cartographer](#cartographer)
+- [足式里程计](#足式里程计)
+  - [SEROW Go2](#serow-go2)
+  - [输入、观测与模型](#输入观测与模型)
 - [maplab](#maplab)
   - [maplab console](#maplab-console)
   - [slam_node vertex 时间轴](#slam_node-vertex-时间轴)
@@ -1750,3 +1753,26 @@ if (flag.compare_exchange_strong(expected, true)) {
   不可分割的操作，可用于保证多个调用者中只有一个取得执行权。
 
 > **来源** · 2026-10-21 · C++ 原子比较交换语义 · chat: `未找到` · workspace: `rob_slam-research`
+
+---
+
+## 足式里程计
+
+> 记录腿式机器人利用 IMU、关节编码器、足端接触和机器人模型估计自身运动状态的原理与实现。
+
+### SEROW Go2
+
+- 当前学习对象：SEROW 的 Go2 slope MCAP demo。
+- 有效输入为 IMU、12 个关节角、四足三维接触力和 Go2 URDF。
+- `base_ground_truth` 仅用于日志评估，`feet_contact` 未被当前 demo 读取；
+  当前配置也不使用视觉、LiDAR 等外部 odometry。
+
+### 输入、观测与模型
+
+- [Go2 MCAP 输入、观测与物理/数学模型](assets/serow_theory.md)
+- 主链路：足端正运动学 → 接触置信度 → 接触脚静止约束 → 接触锚点位置
+  → 腿部速度观测 → Left-Invariant EKF。
+- 文档详细整理了 Jacobian、接触概率、IMP、Base EKF、CoM/外力 EKF、
+  实际输出、源码对应关系和可观性限制。
+
+> **来源** · 2026-10-29 · 足式里程计笔记入口 · chat: `未找到` · workspace: `serow_ws`
